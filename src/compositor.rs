@@ -14,15 +14,14 @@ use tokio::runtime::Runtime;
 
 use smelter_core::{
     AudioChannels, AudioMixerConfig, AudioMixerInputConfig, AudioMixingStrategy,
-    PipelineOutputEndCondition, QueueInputOptions, RegisterInputOptions,
-    RegisterOutputAudioOptions, RegisterOutputOptions, RegisterOutputVideoOptions,
+    PipelineOutputEndCondition, ProtocolInputOptions, ProtocolOutputOptions,
+    QueueInputOptions, RegisterInputOptions, RegisterOutputAudioOptions,
+    RegisterOutputOptions, RegisterOutputVideoOptions,
     codecs::{
         AudioEncoderOptions, FdkAacEncoderOptions, FfmpegH264EncoderOptions,
         FfmpegH264EncoderPreset, OutputPixelFormat, VideoEncoderOptions,
     },
-    protocols::{
-        DeckLinkInputOptions, Mp4OutputOptions, ProtocolInputOptions, ProtocolOutputOptions,
-    },
+    protocols::{DeckLinkInputOptions, Mp4OutputOptions},
 };
 
 use smelter_render::{
@@ -30,14 +29,12 @@ use smelter_render::{
     scene::{Component, InputStreamComponent},
 };
 
-pub const RESOLUTION_FHD: (usize, usize) = (1920, 1080);
+pub const RESOLUTION: (usize, usize) = (1920, 1080);
 
 pub struct Compositor {
     _graphics_context: GraphicsContext,
-    #[cfg(target_os = "linux")]
     pipeline: Arc<Mutex<Pipeline>>,
-    #[cfg(target_os = "linux")]
-    decklink_input: InputId,
+    decklink_inputs: Vec<InputId>,
 }
 
 impl Compositor {
@@ -81,7 +78,7 @@ impl Compositor {
 
         // Register DeckLink input (Linux only)
         let decklinks = decklink::get_decklinks().unwrap_or_else(|_| Vec::new());
-        decklinks
+        let decklink_inputs = decklinks
             .iter()
             .filter_map(|decklink| {
                 // Retrieving the persistent_id is mandatory,
@@ -97,27 +94,30 @@ impl Compositor {
                     };
                 Some(persistent_id)
             })
-            .for_each(|id| {
-                let decklink_input_id = InputId::from(&id);
-                let input_options = RegisterInputOptions {
-                    input_options: ProtocolInputOptions::DeckLink(DeckLinkInputOptions {
-                        display_name: None, // Auto-detect first available DeckLink device
+            .filter_map(|id| {
+                let input_options = ProtocolInputOptions::DeckLink(
+                    smelter_core::protocols::DeckLinkInputOptions {
                         subdevice_index: None,
+                        display_name: None,
                         persistent_id: Some(id.clone()),
                         enable_audio: false,
-                        pixel_format: None, // Auto-detect
-                    }),
-                    queue_options: QueueInputOptions {
-                        required: true,
-                        offset: Some(Duration::ZERO),
+                        pixel_format: Some(decklink::PixelFormat::Format8BitYUV),
                     },
+                );
+                let options = RegisterInputOptions {
+                    input_options,
+                    queue_options: QueueInputOptions { required: false, offset: None },
                 };
 
-                match Pipeline::register_input(&pipeline, decklink_input_id, input_options)
-                    .map_err(|e| anyhow::anyhow!("Failed to register DeckLink input: {}", e))
+                let decklink_input = InputId(Arc::from(format!("decklink_input_{}", id)));
+                match Pipeline::register_input(&pipeline, decklink_input.clone(), options)
                 {
                     Ok(_) => {
-                        tracing::info!("Registered DeckLink input with persistent ID {}", id);
+                        tracing::info!(
+                            "Registered DeckLink input with persistent ID {}",
+                            id
+                        );
+                        Some(decklink_input)
                     }
                     Err(e) => {
                         tracing::error!(
@@ -125,15 +125,13 @@ impl Compositor {
                             id,
                             e
                         );
+                        None
                     }
                 }
-            });
+            })
+            .collect::<Vec<_>>();
 
-        Ok(Self {
-            _graphics_context: graphics_context,
-            pipeline,
-            decklink_input,
-        })
+        Ok(Self { _graphics_context: graphics_context, pipeline, decklink_inputs })
     }
 
     pub fn record_main_output(&self, _path: PathBuf, _duration: Duration) -> Result<()> {
@@ -145,36 +143,20 @@ impl Compositor {
                 output_path: _path.clone(),
                 video: Some(VideoEncoderOptions::FfmpegH264(FfmpegH264EncoderOptions {
                     preset: FfmpegH264EncoderPreset::Fast,
-                    resolution: Resolution {
-                        width: RESOLUTION_FHD.0,
-                        height: RESOLUTION_FHD.1,
-                    },
+                    resolution: Resolution { width: RESOLUTION.0, height: RESOLUTION.1 },
                     pixel_format: OutputPixelFormat::YUV420P,
                     raw_options: vec![],
                 })),
-                audio: Some(AudioEncoderOptions::FdkAac(FdkAacEncoderOptions {
-                    channels: AudioChannels::Stereo,
-                    sample_rate: 48000,
-                })),
+                audio: None,
             }),
             video: Some(RegisterOutputVideoOptions {
                 initial: Component::InputStream(InputStreamComponent {
                     id: None,
-                    input_id: self.decklink_input.clone(),
+                    input_id: self.decklink_inputs[0].clone(),
                 }),
                 end_condition: PipelineOutputEndCondition::AnyInput,
             }),
-            audio: Some(RegisterOutputAudioOptions {
-                initial: AudioMixerConfig {
-                    inputs: vec![AudioMixerInputConfig {
-                        input_id: self.decklink_input.clone(),
-                        volume: 1.0,
-                    }],
-                },
-                mixing_strategy: AudioMixingStrategy::SumClip,
-                channels: AudioChannels::Stereo,
-                end_condition: PipelineOutputEndCondition::AnyInput,
-            }),
+            audio: None,
         };
 
         // Register the recording output
@@ -187,11 +169,9 @@ impl Compositor {
         std::thread::sleep(_duration);
 
         // Stop recording by unregistering the output
-        self.pipeline
-            .lock()
-            .unwrap()
-            .unregister_output(&output_id)
-            .map_err(|e| anyhow::anyhow!("Failed to unregister recording output: {}", e))?;
+        self.pipeline.lock().unwrap().unregister_output(&output_id).map_err(|e| {
+            anyhow::anyhow!("Failed to unregister recording output: {}", e)
+        })?;
 
         tracing::info!("Recording completed");
 
