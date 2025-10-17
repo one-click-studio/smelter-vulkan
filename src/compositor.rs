@@ -13,14 +13,10 @@ use smelter_render::{Framerate, RenderingMode};
 use tokio::runtime::Runtime;
 
 use smelter_core::{
-    AudioChannels, AudioMixerConfig, AudioMixerInputConfig, AudioMixingStrategy,
     PipelineOutputEndCondition, ProtocolInputOptions, ProtocolOutputOptions,
-    QueueInputOptions, RegisterInputOptions, RegisterOutputAudioOptions,
-    RegisterOutputOptions, RegisterOutputVideoOptions,
-    codecs::{
-        AudioEncoderOptions, FdkAacEncoderOptions, FfmpegH264EncoderOptions,
-        FfmpegH264EncoderPreset, OutputPixelFormat, VideoEncoderOptions,
-    },
+    QueueInputOptions, RegisterInputOptions, RegisterOutputOptions,
+    RegisterOutputVideoOptions,
+    codecs::{VideoEncoderOptions, VulkanH264EncoderOptions},
     protocols::{DeckLinkInputOptions, Mp4OutputOptions},
 };
 
@@ -29,7 +25,7 @@ use smelter_render::{
     scene::{Component, InputStreamComponent},
 };
 
-pub const RESOLUTION: (usize, usize) = (1920, 1080);
+pub const RESOLUTION: (usize, usize) = (3840, 2160);
 
 pub struct Compositor {
     _graphics_context: GraphicsContext,
@@ -95,15 +91,14 @@ impl Compositor {
                 Some(persistent_id)
             })
             .filter_map(|id| {
-                let input_options = ProtocolInputOptions::DeckLink(
-                    smelter_core::protocols::DeckLinkInputOptions {
+                let input_options =
+                    ProtocolInputOptions::DeckLink(DeckLinkInputOptions {
                         subdevice_index: None,
                         display_name: None,
                         persistent_id: Some(id.clone()),
                         enable_audio: false,
                         pixel_format: Some(decklink::PixelFormat::Format8BitYUV),
-                    },
-                );
+                    });
                 let options = RegisterInputOptions {
                     input_options,
                     queue_options: QueueInputOptions { required: false, offset: None },
@@ -134,25 +129,26 @@ impl Compositor {
         Ok(Self { _graphics_context: graphics_context, pipeline, decklink_inputs })
     }
 
-    pub fn record_main_output(&self, _path: PathBuf, _duration: Duration) -> Result<()> {
-        let output_id = OutputId(Arc::from("recording_output"));
-
+    pub fn start_record(
+        &self,
+        path: PathBuf,
+        output_id: OutputId,
+        input_id: InputId,
+    ) -> Result<()> {
         // Configure MP4 output with H.264 video and AAC audio
         let output_options = RegisterOutputOptions {
             output_options: ProtocolOutputOptions::Mp4(Mp4OutputOptions {
-                output_path: _path.clone(),
-                video: Some(VideoEncoderOptions::FfmpegH264(FfmpegH264EncoderOptions {
-                    preset: FfmpegH264EncoderPreset::Fast,
+                output_path: path.clone(),
+                video: Some(VideoEncoderOptions::VulkanH264(VulkanH264EncoderOptions {
                     resolution: Resolution { width: RESOLUTION.0, height: RESOLUTION.1 },
-                    pixel_format: OutputPixelFormat::YUV420P,
-                    raw_options: vec![],
+                    bitrate: None,
                 })),
                 audio: None,
             }),
             video: Some(RegisterOutputVideoOptions {
                 initial: Component::InputStream(InputStreamComponent {
                     id: None,
-                    input_id: self.decklink_inputs[0].clone(),
+                    input_id,
                 }),
                 end_condition: PipelineOutputEndCondition::AnyInput,
             }),
@@ -163,18 +159,38 @@ impl Compositor {
         Pipeline::register_output(&self.pipeline, output_id.clone(), output_options)
             .map_err(|e| anyhow::anyhow!("Failed to register recording output: {}", e))?;
 
-        tracing::info!("Recording to {:?} for {:?}", _path, _duration);
+        tracing::info!("Recording {:?} at {:?}", output_id, path);
+
+        Ok(())
+    }
+
+    pub fn start_recording(&self, path: PathBuf, duration: Duration) -> Result<()> {
+        let mut output_ids = Vec::new();
+        for input_id in self.decklink_inputs.clone() {
+            let output_id =
+                OutputId(Arc::from(format!("recording_output_{}", input_id.0)));
+            self.start_record(
+                path.join(format!("recording_{}.mp4", input_id.0)),
+                output_id.clone(),
+                input_id,
+            )?;
+            output_ids.push(output_id);
+        }
+
+        tracing::info!("Recording for {:?}", duration);
 
         // Wait for the specified duration
-        std::thread::sleep(_duration);
+        std::thread::sleep(duration);
 
-        // Stop recording by unregistering the output
-        self.pipeline.lock().unwrap().unregister_output(&output_id).map_err(|e| {
-            anyhow::anyhow!("Failed to unregister recording output: {}", e)
-        })?;
+        // Stop recording by unregistering outputs
+        for output_id in output_ids.iter() {
+            self.pipeline.lock().unwrap().unregister_output(output_id).map_err(|e| {
+                anyhow::anyhow!("Failed to unregister recording output: {}", e)
+            })?;
+        }
 
+        std::thread::sleep(Duration::from_millis(500));
         tracing::info!("Recording completed");
-
         Ok(())
     }
 }

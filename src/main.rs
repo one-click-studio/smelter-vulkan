@@ -14,10 +14,11 @@ fn main() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         let compositor = compositor::Compositor::new()?;
-        compositor.record_main_output(
-            "output_recording.mp4".into(),
-            std::time::Duration::from_secs(10),
-        )?;
+
+        let folder_path = "./recordings/".into();
+        std::fs::create_dir_all(&folder_path)?;
+
+        compositor.start_recording(folder_path, std::time::Duration::from_secs(600))?;
     }
     #[cfg(not(target_os = "linux"))]
     {

@@ -22,5 +22,6 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 # DeckLink is only supported on Linux
 smelter-core = { git = "https://github.com/software-mansion/smelter.git", rev = "005137d", features = [
     "decklink",
+    "vk-video",
 ] }
 decklink = { git = "https://github.com/software-mansion/smelter.git", rev = "005137d" }
