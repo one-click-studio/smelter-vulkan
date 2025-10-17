@@ -1,0 +1,26 @@
+[package]
+name = "smelter-decklink-audio"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Compositor integration
+smelter-core = { git = "https://github.com/software-mansion/smelter.git", rev = "005137d" }
+smelter-render = { git = "https://github.com/software-mansion/smelter.git", rev = "005137d", features = [
+    "web-renderer",
+] }
+# Runtime
+tokio = { version = "1", features = ["full"] }
+# Graphics (required by compositor)
+wgpu = "25.0.2"
+# Error handling and utilities
+anyhow = "1.0.99"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# DeckLink is only supported on Linux
+smelter-core = { git = "https://github.com/software-mansion/smelter.git", rev = "005137d", features = [
+    "decklink",
+] }
+decklink = { git = "https://github.com/software-mansion/smelter.git", rev = "005137d" }
