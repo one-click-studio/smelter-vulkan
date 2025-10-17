@@ -80,23 +80,54 @@ impl Compositor {
         Pipeline::start(&pipeline);
 
         // Register DeckLink input (Linux only)
-        let decklink_input = InputId(Arc::from("decklink_input"));
-        let input_options = RegisterInputOptions {
-            input_options: ProtocolInputOptions::DeckLink(DeckLinkInputOptions {
-                display_name: None, // Auto-detect first available DeckLink device
-                subdevice_index: None,
-                persistent_id: None,
-                enable_audio: true,
-                pixel_format: None, // Auto-detect
-            }),
-            queue_options: QueueInputOptions {
-                required: true,
-                offset: Some(Duration::ZERO),
-            },
-        };
+        let decklinks = decklink::get_decklinks().unwrap_or_else(|_| Vec::new());
+        decklinks
+            .iter()
+            .filter_map(|decklink| {
+                // Retrieving the persistent_id is mandatory,
+                // it is the only way to later specify which device to use as an input
+                let attr = match decklink.profile_attributes() {
+                    Ok(attr) => attr,
+                    Err(_) => return None,
+                };
+                let persistent_id =
+                    match attr.get_integer(decklink::IntegerAttributeId::PersistentID) {
+                        Ok(Some(id)) => id as u32,
+                        _ => return None,
+                    };
+                Some(persistent_id)
+            })
+            .for_each(|id| {
+                let decklink_input_id = InputId::from(&id);
+                let input_options = RegisterInputOptions {
+                    input_options: ProtocolInputOptions::DeckLink(DeckLinkInputOptions {
+                        display_name: None, // Auto-detect first available DeckLink device
+                        subdevice_index: None,
+                        persistent_id: Some(id.clone()),
+                        enable_audio: false,
+                        pixel_format: None, // Auto-detect
+                    }),
+                    queue_options: QueueInputOptions {
+                        required: true,
+                        offset: Some(Duration::ZERO),
+                    },
+                };
 
-        Pipeline::register_input(&pipeline, decklink_input.clone(), input_options)
-            .map_err(|e| anyhow::anyhow!("Failed to register DeckLink input: {}", e))?;
+                match Pipeline::register_input(&pipeline, decklink_input_id, input_options)
+                    .map_err(|e| anyhow::anyhow!("Failed to register DeckLink input: {}", e))
+                {
+                    Ok(_) => {
+                        tracing::info!("Registered DeckLink input with persistent ID {}", id);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Error registering DeckLink input with persistent ID {}: {}",
+                            id,
+                            e
+                        );
+                    }
+                }
+            });
 
         Ok(Self {
             _graphics_context: graphics_context,
