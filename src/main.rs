@@ -6,9 +6,7 @@ mod compositor;
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
-        .with_env_filter(
-            "smelter_decklink_audio=info,compositor_pipeline=error,compositor_render=error",
-        )
+        .with_env_filter("error,smelter_vulkan=info")
         .init();
 
     #[cfg(target_os = "linux")]
