@@ -1,28 +1,7 @@
-[package]
-name = "smelter_vulkan"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-# Compositor integration
-smelter-core = { git = "https://github.com/software-mansion/smelter.git", rev = "005137d" }
-smelter-render = { git = "https://github.com/software-mansion/smelter.git", rev = "005137d", features = [
-    "web-renderer",
-] }
-# Runtime
-tokio = { version = "1", features = ["full"] }
-# Graphics (required by compositor)
-wgpu = "25.0.2"
-winit = "0.30.12"
-# Error handling and utilities
-anyhow = "1.0.99"
-tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-# DeckLink is only supported on Linux
-smelter-core = { git = "https://github.com/software-mansion/smelter.git", rev = "005137d", features = [
-    "decklink",
-    "vk-video",
-] }
-decklink = { git = "https://github.com/software-mansion/smelter.git", rev = "005137d" }
+[workspace]
+members = [
+    "crates/smelter-vulkan",
+    "crates/process_helper",
+]
+default-members = ["crates/smelter-vulkan"]
+resolver = "2"

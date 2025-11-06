@@ -3376,6 +3376,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "process_helper"
+version = "0.1.0"
+dependencies = [
+ "smelter-render",
+]
+
+[[package]]
 name = "profiling"
 version = "1.0.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"

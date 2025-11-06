@@ -10,6 +10,7 @@ use smelter_core::{
     graphics_context::{GraphicsContext, GraphicsContextOptions},
 };
 use smelter_render::{Framerate, RenderingMode};
+use smelter_render::web_renderer::ChromiumContext;
 use tokio::runtime::Runtime;
 
 use smelter_core::{
@@ -25,7 +26,11 @@ use smelter_render::{
     scene::{Component, InputStreamComponent},
 };
 
+use crate::window::WgpuContext;
+
 pub const RESOLUTION: (usize, usize) = (3840, 2160);
+const FRAME_RATE: u32 = 30;
+const AUDIO_SAMPLE_RATE: u32 = 48000;
 
 pub struct Compositor {
     _graphics_context: GraphicsContext,
@@ -34,34 +39,49 @@ pub struct Compositor {
 }
 
 impl Compositor {
-    pub fn new() -> Result<Self> {
-        // Initialize graphics context
+    /// Create a new compositor and return both the compositor and the WGPU context
+    /// The WGPU context can be shared with the window manager
+    pub fn new() -> Result<(Self, WgpuContext)> {
+        // Initialize graphics context via Smelter
         let graphics_context = GraphicsContext::new(GraphicsContextOptions {
             force_gpu: false,
             features: wgpu::Features::empty(),
             limits: wgpu::Limits::default(),
-            compatible_surface: None,
+            compatible_surface: None, // No surface at initialization
             libvulkan_path: None,
         })
         .map_err(|e| anyhow::anyhow!("Failed to create graphics context: {}", e))?;
 
+        // Extract WGPU context for sharing with window manager
+        let wgpu_context = WgpuContext {
+            instance: graphics_context.instance.clone(),
+            adapter: graphics_context.adapter.clone(),
+            device: graphics_context.device.clone(),
+            queue: graphics_context.queue.clone(),
+        };
+
+        // Create ChromiumContext for web rendering
+        let framerate = Framerate { num: FRAME_RATE, den: 1 };
+        let chromium_context = ChromiumContext::new(framerate, true)
+            .map_err(|e| anyhow::anyhow!("Failed to create Chromium context: {}", e))?;
+
         // Create and start pipeline
         let pipeline_options = PipelineOptions {
-            stream_fallback_timeout: Duration::from_secs(5),
-            default_buffer_duration: Duration::from_millis(80), // ~5 frames at 60fps
-            load_system_fonts: true,
-            run_late_scheduled_events: false,
+            stream_fallback_timeout: Duration::from_millis(500),
+            default_buffer_duration: Duration::from_millis(100),
+            load_system_fonts: false,
+            run_late_scheduled_events: true,
             never_drop_output_frames: false,
             ahead_of_time_processing: false,
-            output_framerate: Framerate { num: 30, den: 1 },
-            mixing_sample_rate: 48000,
+            output_framerate: framerate,
+            mixing_sample_rate: AUDIO_SAMPLE_RATE,
             download_root: PathBuf::from("/tmp/smelter-downloads").into(),
             rendering_mode: RenderingMode::GpuOptimized,
             wgpu_options: PipelineWgpuOptions::Context(graphics_context.clone()),
             tokio_rt: Some(Arc::new(Runtime::new().map_err(|e| {
                 anyhow::anyhow!("Failed to create Tokio runtime: {}", e)
             })?)),
-            chromium_context: None,
+            chromium_context: Some(chromium_context),
             whip_whep_server: PipelineWhipWhepServerOptions::Disable,
             whip_whep_stun_servers: Arc::new(vec![]),
         };
@@ -130,7 +150,13 @@ impl Compositor {
             })
             .collect::<Vec<_>>();
 
-        Ok(Self { _graphics_context: graphics_context, pipeline, decklink_inputs })
+        let compositor = Self {
+            _graphics_context: graphics_context,
+            pipeline,
+            decklink_inputs,
+        };
+
+        Ok((compositor, wgpu_context))
     }
 
     pub fn start_record(

@@ -1,0 +1,9 @@
+[package]
+name = "process_helper"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+smelter-render = { git = "https://github.com/software-mansion/smelter.git", rev = "005137d", features = [
+    "web-renderer",
+] }
