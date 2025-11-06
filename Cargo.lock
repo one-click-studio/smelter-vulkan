@@ -3691,20 +3691,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "smelter-decklink-audio"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "decklink",
- "smelter-core",
- "smelter-render",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "wgpu",
-]
-
-[[package]]
 name = "smelter-render"
 version = "0.1.0"
 source = "git+https://github.com/software-mansion/smelter.git?rev=005137d#005137d44c70deffef8865b5c925f255836edc8c"
@@ -3726,6 +3712,20 @@ dependencies = [
  "sys-locale",
  "thiserror 1.0.69",
  "tracing",
+ "wgpu",
+]
+
+[[package]]
+name = "smelter_vulkan"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "decklink",
+ "smelter-core",
+ "smelter-render",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
  "wgpu",
 ]
 

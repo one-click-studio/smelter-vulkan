@@ -73,7 +73,11 @@ impl Compositor {
         Pipeline::start(&pipeline);
 
         // Register DeckLink input (Linux only)
-        let decklinks = decklink::get_decklinks().unwrap_or_else(|_| Vec::new());
+        let decklinks = decklink::get_decklinks().unwrap_or_else(|e| {
+            tracing::warn!("Failed to get DeckLink devices: {}", e);
+            Vec::new()
+        });
+        tracing::info!("Found {} DeckLink device(s)", decklinks.len());
         let decklink_inputs = decklinks
             .iter()
             .filter_map(|decklink| {
@@ -165,6 +169,13 @@ impl Compositor {
     }
 
     pub fn start_recording(&self, path: PathBuf, duration: Duration) -> Result<()> {
+        tracing::info!("Starting recording with {} DeckLink input(s)", self.decklink_inputs.len());
+
+        if self.decklink_inputs.is_empty() {
+            tracing::warn!("No DeckLink inputs registered - nothing to record!");
+            return Ok(());
+        }
+
         let mut output_ids = Vec::new();
         for input_id in self.decklink_inputs.clone() {
             let output_id =

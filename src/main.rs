@@ -3,6 +3,8 @@ use anyhow::Result;
 #[cfg(target_os = "linux")]
 mod compositor;
 
+const RECORDING_DURATION_SECS: u64 = 600;
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
@@ -16,7 +18,7 @@ fn main() -> Result<()> {
         let folder_path = "./recordings/".into();
         std::fs::create_dir_all(&folder_path)?;
 
-        compositor.start_recording(folder_path, std::time::Duration::from_secs(600))?;
+        compositor.start_recording(folder_path, std::time::Duration::from_secs(RECORDING_DURATION_SECS))?;
     }
     #[cfg(not(target_os = "linux"))]
     {
