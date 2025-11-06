@@ -52,6 +52,12 @@ impl Compositor {
         })
         .map_err(|e| anyhow::anyhow!("Failed to create graphics context: {}", e))?;
 
+        // Set up device error handler for debugging
+        graphics_context.device.on_uncaptured_error(Box::new(|error| {
+            tracing::error!("WGPU Device Error: {:?}", error);
+            panic!("WGPU device error detected: {:?}", error);
+        }));
+
         // Extract WGPU context for sharing with window manager
         let wgpu_context = WgpuContext {
             instance: graphics_context.instance.clone(),

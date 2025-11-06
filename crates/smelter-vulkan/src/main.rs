@@ -37,6 +37,14 @@ fn cleanup() -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    // Set up panic hook to ensure we exit cleanly on panic
+    std::panic::set_hook(Box::new(|panic_info| {
+        eprintln!("FATAL ERROR - Application panicked!");
+        eprintln!("{}", panic_info);
+        eprintln!("\nThe application will now exit.");
+        std::process::exit(1);
+    }));
+
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_env_filter("error,smelter_vulkan=info,smelter_core=warn,compositor_pipeline=warn,compositor_render=warn")

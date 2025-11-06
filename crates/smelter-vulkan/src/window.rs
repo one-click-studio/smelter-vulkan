@@ -131,6 +131,10 @@ fn configure_surface(
     wgpu_context: &WgpuContext,
 ) -> Result<()> {
     let surface_caps = surface.get_capabilities(&wgpu_context.adapter);
+
+    tracing::debug!("Surface capabilities: formats={:?}, present_modes={:?}",
+        surface_caps.formats, surface_caps.present_modes);
+
     let surface_format = surface_caps
         .formats
         .iter()
@@ -150,7 +154,8 @@ fn configure_surface(
     };
 
     surface.configure(&wgpu_context.device, &surface_config);
-    tracing::debug!("Configured surface: {}x{}, format: {:?}", size.width, size.height, surface_format);
+    tracing::info!("Configured surface: {}x{}, format: {:?}, present_mode: {:?}",
+        size.width, size.height, surface_format, surface_config.present_mode);
     Ok(())
 }
 
