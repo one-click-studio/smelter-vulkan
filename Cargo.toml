@@ -13,6 +13,7 @@ smelter-render = { git = "https://github.com/software-mansion/smelter.git", rev 
 tokio = { version = "1", features = ["full"] }
 # Graphics (required by compositor)
 wgpu = "25.0.2"
+winit = "0.30.12"
 # Error handling and utilities
 anyhow = "1.0.99"
 tracing = "0.1.41"
