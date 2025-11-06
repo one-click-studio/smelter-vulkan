@@ -16,9 +16,9 @@ use tokio::runtime::Runtime;
 use smelter_core::{
     PipelineOutputEndCondition, ProtocolInputOptions, ProtocolOutputOptions,
     QueueInputOptions, RegisterInputOptions, RegisterOutputOptions,
-    RegisterOutputVideoOptions,
+    RegisterOutputVideoOptions, RegisterRawDataOutputOptions,
     codecs::{VideoEncoderOptions, VulkanH264EncoderOptions},
-    protocols::{DeckLinkInputOptions, Mp4OutputOptions},
+    protocols::{DeckLinkInputOptions, Mp4OutputOptions, RawDataOutputOptions, RawDataOutputVideoOptions, RawDataOutputReceiver},
 };
 
 use smelter_render::{
@@ -200,8 +200,9 @@ impl Compositor {
         Ok(())
     }
 
-    pub fn start_recording(&self, path: PathBuf, duration: Duration) -> Result<()> {
-        tracing::info!("Starting recording with {} DeckLink input(s)", self.decklink_inputs.len());
+    pub fn start_recording(&self, path: PathBuf, duration: Duration, max_decklinks: usize) -> Result<()> {
+        let num_to_record = std::cmp::min(max_decklinks, self.decklink_inputs.len());
+        tracing::info!("Starting recording with {} of {} DeckLink input(s)", num_to_record, self.decklink_inputs.len());
 
         if self.decklink_inputs.is_empty() {
             tracing::warn!("No DeckLink inputs registered - nothing to record!");
@@ -209,7 +210,7 @@ impl Compositor {
         }
 
         let mut output_ids = Vec::new();
-        for input_id in self.decklink_inputs.clone() {
+        for input_id in self.decklink_inputs.iter().take(num_to_record).cloned() {
             let output_id =
                 OutputId(Arc::from(format!("recording_output_{}", input_id.0)));
             self.start_record(
@@ -235,5 +236,51 @@ impl Compositor {
         std::thread::sleep(Duration::from_millis(500));
         tracing::info!("Recording completed");
         Ok(())
+    }
+
+    /// Get the first DeckLink input ID if available
+    pub fn first_decklink_input(&self) -> Option<InputId> {
+        self.decklink_inputs.first().cloned()
+    }
+
+    /// Register a raw data output with bounded(1) channels for window preview
+    ///
+    /// This provides tighter backpressure than the default bounded(100), coordinating
+    /// frame production and consumption similar to how vk-video encoders work.
+    pub fn register_window_preview_output(
+        &self,
+        output_id: OutputId,
+        input_id: InputId,
+    ) -> Result<RawDataOutputReceiver> {
+        let register_options = RegisterRawDataOutputOptions {
+            output_options: RawDataOutputOptions {
+                video: Some(RawDataOutputVideoOptions {
+                    resolution: Resolution {
+                        width: RESOLUTION.0,
+                        height: RESOLUTION.1,
+                    },
+                }),
+                audio: None,
+            },
+            video: Some(RegisterOutputVideoOptions {
+                initial: Component::InputStream(InputStreamComponent {
+                    id: None,
+                    input_id,
+                }),
+                end_condition: PipelineOutputEndCondition::Never,
+            }),
+            audio: None,
+        };
+
+        // Register raw data output (will use bounded(1) after we patch smelter-core)
+        let receiver = Pipeline::register_raw_data_output(
+            &self.pipeline,
+            output_id.clone(),
+            register_options,
+        )?;
+
+        tracing::info!("Registered window preview output: {:?}", output_id);
+
+        Ok(receiver)
     }
 }

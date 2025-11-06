@@ -18,6 +18,8 @@ winit = "0.30.12"
 anyhow = "1.0.99"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+# Channels for bounded(1) implementation
+crossbeam-channel = "0.5"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # DeckLink is only supported on Linux

@@ -4294,6 +4294,7 @@ name = "smelter_vulkan"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "crossbeam-channel",
  "decklink",
  "smelter-core",
  "smelter-render",
