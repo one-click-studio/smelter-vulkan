@@ -188,6 +188,7 @@ fn main() -> Result<()> {
         tracing::info!("Step 6: Starting window manager event loop with bridge texture");
         window_manager.run(
             compositor_context.bridge_memory_fd,
+            compositor_context.resolution,
             None, // Don't pass frame_receiver to window anymore
         )?;
     }

@@ -32,7 +32,12 @@ use smelter_render::{
 
 use crate::external_memory::{BridgeTextureExport, create_bridge_texture_export};
 
-pub const RESOLUTION: (usize, usize) = (1920, 1080);
+/// Resolution for MP4 recording outputs (4K)
+pub const RECORDING_RESOLUTION: (usize, usize) = (3840, 2160);
+
+/// Resolution for window preview / bridge texture (can be lower for performance)
+pub const PREVIEW_RESOLUTION: (usize, usize) = (1920, 1080);
+
 const FRAME_RATE: u32 = 30;
 const AUDIO_SAMPLE_RATE: u32 = 48000;
 
@@ -47,6 +52,7 @@ use std::os::fd::RawFd;
 
 pub struct CompositorContext {
     pub bridge_memory_fd: RawFd,
+    pub resolution: (u32, u32),
 }
 
 impl Compositor {
@@ -70,8 +76,12 @@ impl Compositor {
         }));
 
         // Create bridge texture with external memory for sharing with window
-        tracing::info!("Creating bridge texture with external memory...");
-        let bridge_texture = create_bridge_texture_export(&graphics_context.device)
+        tracing::info!("Creating bridge texture with external memory at {}x{}...",
+            PREVIEW_RESOLUTION.0, PREVIEW_RESOLUTION.1);
+        let bridge_texture = create_bridge_texture_export(
+            &graphics_context.device,
+            (PREVIEW_RESOLUTION.0 as u32, PREVIEW_RESOLUTION.1 as u32)
+        )
             .map_err(|e| anyhow::anyhow!("Failed to create bridge texture: {}", e))?;
 
         let bridge_memory_fd = bridge_texture.external_handle.memory_fd;
@@ -176,6 +186,7 @@ impl Compositor {
 
         let context = CompositorContext {
             bridge_memory_fd,
+            resolution: (PREVIEW_RESOLUTION.0 as u32, PREVIEW_RESOLUTION.1 as u32),
         };
 
         Ok((compositor, context))
@@ -192,7 +203,7 @@ impl Compositor {
             output_options: ProtocolOutputOptions::Mp4(Mp4OutputOptions {
                 output_path: path.clone(),
                 video: Some(VideoEncoderOptions::VulkanH264(VulkanH264EncoderOptions {
-                    resolution: Resolution { width: RESOLUTION.0, height: RESOLUTION.1 },
+                    resolution: Resolution { width: RECORDING_RESOLUTION.0, height: RECORDING_RESOLUTION.1 },
                     bitrate: None,
                 })),
                 audio: None,
@@ -273,8 +284,8 @@ impl Compositor {
             output_options: RawDataOutputOptions {
                 video: Some(RawDataOutputVideoOptions {
                     resolution: Resolution {
-                        width: RESOLUTION.0,
-                        height: RESOLUTION.1,
+                        width: PREVIEW_RESOLUTION.0,
+                        height: PREVIEW_RESOLUTION.1,
                     },
                 }),
                 audio: None,
@@ -287,8 +298,8 @@ impl Compositor {
                         input_id,
                     })),
                     position: Position::Static {
-                        width: Some(RESOLUTION.0 as f32),
-                        height: Some(RESOLUTION.1 as f32),
+                        width: Some(PREVIEW_RESOLUTION.0 as f32),
+                        height: Some(PREVIEW_RESOLUTION.1 as f32),
                     },
                     transition: None,
                     mode: RescaleMode::Fill,

@@ -179,6 +179,7 @@ impl WindowManager {
     pub fn run(
         self,
         bridge_memory_fd: RawFd,
+        resolution: (u32, u32),
         frame_receiver: Option<RawDataOutputReceiver>,
     ) -> Result<()> {
         let event_loop = self
@@ -190,8 +191,9 @@ impl WindowManager {
         let wgpu_context = Self::create_wgpu_context()?;
 
         // Import bridge texture from file descriptor
-        tracing::info!("Importing bridge texture from FD: {}", bridge_memory_fd);
-        let bridge_texture = import_bridge_texture(&wgpu_context.device, bridge_memory_fd)
+        tracing::info!("Importing bridge texture from FD: {} with resolution {}x{}",
+            bridge_memory_fd, resolution.0, resolution.1);
+        let bridge_texture = import_bridge_texture(&wgpu_context.device, bridge_memory_fd, resolution)
             .map_err(|e| anyhow::anyhow!("Failed to import bridge texture: {}", e))?;
 
         let target_frame_duration = Duration::from_secs_f64(1.0 / self.target_fps);

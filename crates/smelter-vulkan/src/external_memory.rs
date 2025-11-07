@@ -11,10 +11,6 @@ use wgpu::hal::api::Vulkan as VkApi;
 use wgpu::hal::vulkan as hal_vulkan;
 use wgpu_types::TextureUses;
 
-/// Resolution for the bridge texture (matches compositor output)
-/// Note: This should match the actual DeckLink input resolution or the resolution
-/// specified in the RawDataOutputVideoOptions
-pub const BRIDGE_RESOLUTION: (u32, u32) = (1920, 1080);
 
 /// External memory handle representing a shared texture
 #[allow(dead_code)]
@@ -62,7 +58,7 @@ pub fn check_external_memory_support(device: &wgpu::Device) -> Result<()> {
 }
 
 /// Create a bridge texture with external memory support on the exporting device
-pub fn create_bridge_texture_export(device: &wgpu::Device) -> Result<BridgeTextureExport> {
+pub fn create_bridge_texture_export(device: &wgpu::Device, resolution: (u32, u32)) -> Result<BridgeTextureExport> {
     unsafe { device.as_hal::<VkApi, _, _>(|hal_device| {
         let Some(hal_device) = hal_device else {
             anyhow::bail!("Failed to get Vulkan HAL device");
@@ -77,8 +73,8 @@ pub fn create_bridge_texture_export(device: &wgpu::Device) -> Result<BridgeTextu
             .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
 
         let extent = vk::Extent3D {
-            width: BRIDGE_RESOLUTION.0,
-            height: BRIDGE_RESOLUTION.1,
+            width: resolution.0,
+            height: resolution.1,
             depth: 1,
         };
 
@@ -156,8 +152,8 @@ pub fn create_bridge_texture_export(device: &wgpu::Device) -> Result<BridgeTextu
                 &wgpu_hal::TextureDescriptor {
                     label: Some("Bridge Texture Export"),
                     size: wgpu::Extent3d {
-                        width: BRIDGE_RESOLUTION.0,
-                        height: BRIDGE_RESOLUTION.1,
+                        width: resolution.0,
+                        height: resolution.1,
                         depth_or_array_layers: 1,
                     },
                     mip_level_count: 1,
@@ -179,8 +175,8 @@ pub fn create_bridge_texture_export(device: &wgpu::Device) -> Result<BridgeTextu
                 &wgpu::TextureDescriptor {
                     label: Some("Bridge Texture Export"),
                     size: wgpu::Extent3d {
-                        width: BRIDGE_RESOLUTION.0,
-                        height: BRIDGE_RESOLUTION.1,
+                        width: resolution.0,
+                        height: resolution.1,
                         depth_or_array_layers: 1,
                     },
                     mip_level_count: 1,
@@ -212,6 +208,7 @@ pub fn create_bridge_texture_export(device: &wgpu::Device) -> Result<BridgeTextu
 pub fn import_bridge_texture(
     device: &wgpu::Device,
     memory_fd: RawFd,
+    resolution: (u32, u32),
 ) -> Result<BridgeTextureImport> {
     unsafe { device.as_hal::<VkApi, _, _>(|hal_device| {
         let Some(hal_device) = hal_device else {
@@ -227,8 +224,8 @@ pub fn import_bridge_texture(
             .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
 
         let extent = vk::Extent3D {
-            width: BRIDGE_RESOLUTION.0,
-            height: BRIDGE_RESOLUTION.1,
+            width: resolution.0,
+            height: resolution.1,
             depth: 1,
         };
 
@@ -287,8 +284,8 @@ pub fn import_bridge_texture(
                 &wgpu_hal::TextureDescriptor {
                     label: Some("Bridge Texture Import"),
                     size: wgpu::Extent3d {
-                        width: BRIDGE_RESOLUTION.0,
-                        height: BRIDGE_RESOLUTION.1,
+                        width: resolution.0,
+                        height: resolution.1,
                         depth_or_array_layers: 1,
                     },
                     mip_level_count: 1,
@@ -309,8 +306,8 @@ pub fn import_bridge_texture(
                 &wgpu::TextureDescriptor {
                     label: Some("Bridge Texture Import"),
                     size: wgpu::Extent3d {
-                        width: BRIDGE_RESOLUTION.0,
-                        height: BRIDGE_RESOLUTION.1,
+                        width: resolution.0,
+                        height: resolution.1,
                         depth_or_array_layers: 1,
                     },
                     mip_level_count: 1,
