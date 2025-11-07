@@ -8,6 +8,7 @@ mod window;
 
 const RECORDING_DURATION_SECS: u64 = 60;
 const MAX_DECKLINKS_TO_RECORD: usize = 3;
+const ENABLE_FRAME_STATS: bool = false;
 
 /// Clean up existing .mp4 files in the recordings directory
 fn cleanup() -> Result<()> {
@@ -66,24 +67,23 @@ fn main() -> Result<()> {
     // Step 1: Create WindowManager FIRST (REQUIRED before WGPU/Compositor)
     // This initializes the winit event loop which must exist before graphics
     tracing::info!("Step 1: Creating WindowManager (MUST be first)");
-    let window_manager = window::WindowManager::new()?;
+    let window_manager = window::WindowManager::new(ENABLE_FRAME_STATS)?;
+
+    // Get the event loop proxy for sending commands to the window
+    let window_proxy = window_manager.proxy()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get event loop proxy"))?;
 
     #[cfg(target_os = "linux")]
     {
-        use std::sync::{Arc, Mutex, Condvar};
+        use std::sync::{Arc, Mutex};
 
         // Step 2: Initialize Compositor with bridge texture
         tracing::info!("Step 2: Creating Compositor with bridge texture");
         let (compositor, compositor_context) = compositor::Compositor::new()?;
 
-        // Step 3: Create synchronization primitive for bridge texture
-        tracing::info!("Step 3: Creating bridge synchronization signal");
-        let bridge_ready_signal: window::BridgeReadySignal = Arc::new((Mutex::new(false), Condvar::new()));
-        let bridge_ready_clone = bridge_ready_signal.clone();
-
-        // Step 4: Register window preview output with bounded(1) channel (if we have inputs)
+        // Step 3: Register window preview output with bounded(1) channel (if we have inputs)
         let frame_receiver = if let Some(input_id) = compositor.first_decklink_input() {
-            tracing::info!("Step 4: Registering window preview output");
+            tracing::info!("Step 3: Registering window preview output");
             let output_id = smelter_render::OutputId(Arc::from("window_preview"));
             match compositor.register_window_preview_output(output_id, input_id.clone()) {
                 Ok(receiver) => {
@@ -100,12 +100,13 @@ fn main() -> Result<()> {
             None
         };
 
-        // Step 5: Start frame copy loop in separate thread
+        // Step 4: Start frame copy loop in separate thread
         // This receives frames from Smelter and copies them to the bridge texture
         if let Some(ref receiver) = frame_receiver {
             let receiver_clone = Arc::new(Mutex::new(receiver.clone()));
             let compositor_ref = Arc::new(Mutex::new(compositor));
             let compositor_clone = compositor_ref.clone();
+            let window_proxy_clone = window_proxy.clone();
 
             thread::spawn(move || {
                 tracing::info!("Frame copy loop started");
@@ -141,20 +142,20 @@ fn main() -> Result<()> {
                                 tracing::error!("Failed to copy frame to bridge: {}", e);
                                 continue;
                             }
+                            // GPU sync completed in copy_frame_to_bridge via device.poll()
 
-                            // Signal window that bridge is ready
-                            let (lock, cvar) = &*bridge_ready_clone;
-                            let mut ready = lock.lock().unwrap();
-                            *ready = true;
-                            cvar.notify_one();
-                            drop(ready);
+                            // Send redraw command to window via EventLoopProxy
+                            if let Err(e) = window_proxy_clone.send_event(window::WindowCommand::RequestRedraw) {
+                                tracing::error!("Failed to send redraw command: {}", e);
+                                break;
+                            }
                         }
                     }
                 }
                 tracing::info!("Frame copy loop exited");
             });
 
-            // Step 6: Start recording in a separate thread
+            // Step 5: Start recording in a separate thread
             thread::spawn(move || -> Result<()> {
                 // Wait 5 seconds for pipeline to stabilize
                 thread::sleep(std::time::Duration::from_secs(5));
@@ -182,19 +183,16 @@ fn main() -> Result<()> {
             });
         }
 
-        // Step 7: Run window event loop with bridge texture FD (blocking)
-        tracing::info!("Step 7: Starting window manager event loop with bridge texture");
+        // Step 6: Run window event loop with bridge texture FD (blocking)
+        tracing::info!("Step 6: Starting window manager event loop with bridge texture");
         window_manager.run(
             compositor_context.bridge_memory_fd,
             None, // Don't pass frame_receiver to window anymore
-            bridge_ready_signal,
         )?;
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        use std::sync::{Arc, Mutex, Condvar};
-
         tracing::warn!("Compositor is only supported on Linux.");
         tracing::error!("This application requires Linux with DeckLink and Vulkan video support");
         anyhow::bail!("Unsupported platform - Linux required");

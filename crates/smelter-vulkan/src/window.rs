@@ -1,16 +1,27 @@
 use anyhow::Result;
 use smelter_core::protocols::RawDataOutputReceiver;
-use std::sync::{Arc, Mutex, Condvar};
+use std::sync::Arc;
 use std::os::fd::RawFd;
+use std::time::Instant;
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
     event::WindowEvent,
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     window::{Window, WindowId},
 };
 
 use crate::external_memory::{BridgeTextureImport, import_bridge_texture};
+
+/// Command sent from compositor thread to window
+#[derive(Debug, Clone)]
+pub enum WindowCommand {
+    /// Request a redraw with a new frame available
+    RequestRedraw,
+}
+
+/// Type alias for the event loop proxy
+pub type WindowCommandProxy = EventLoopProxy<WindowCommand>;
 
 /// Independent WGPU context for window rendering (separate from Smelter's instance)
 #[derive(Clone)]
@@ -20,9 +31,6 @@ pub struct WgpuContext {
     pub device: Arc<wgpu::Device>,
     pub queue: Arc<wgpu::Queue>,
 }
-
-/// Synchronization primitive for bridge texture readiness (CPU-based)
-pub type BridgeReadySignal = Arc<(Mutex<bool>, Condvar)>;
 
 /// Manages a single window with its surface
 pub struct WgpuWindow {
@@ -137,38 +145,46 @@ fn configure_surface(
 /// Manages the application window using winit
 /// MUST be created BEFORE compositor initialization
 pub struct WindowManager {
-    event_loop: Option<EventLoop<()>>,
+    event_loop: Option<EventLoop<WindowCommand>>,
+    proxy: Option<WindowCommandProxy>,
+    enable_frame_stats: bool,
 }
 
 impl WindowManager {
     /// Create a new WindowManager with an event loop
     /// CRITICAL: This MUST be called before WGPU/Compositor initialization
-    pub fn new() -> Result<Self> {
-        let event_loop = EventLoop::builder().build()?;
+    pub fn new(enable_frame_stats: bool) -> Result<Self> {
+        let event_loop = EventLoop::<WindowCommand>::with_user_event().build()?;
+        let proxy = event_loop.create_proxy();
         Ok(Self {
             event_loop: Some(event_loop),
+            proxy: Some(proxy),
+            enable_frame_stats,
         })
     }
 
-    /// Run the window event loop with bridge texture FD and frame receiver
+    /// Get the event loop proxy for sending commands
+    pub fn proxy(&self) -> Option<WindowCommandProxy> {
+        self.proxy.clone()
+    }
+
+    /// Run the window event loop with bridge texture FD
     ///
     /// Creates an independent WGPU instance and imports the bridge texture
     /// using the provided file descriptor from the compositor.
     ///
-    /// The receiver contains frames from the compositor with bounded(1) backpressure.
-    /// The window will only redraw when frames are available, and consuming a frame
-    /// allows the compositor to produce the next one.
+    /// Redraw requests are triggered via the EventLoopProxy when the compositor
+    /// has written a new frame to the bridge texture.
     pub fn run(
         self,
         bridge_memory_fd: RawFd,
         frame_receiver: Option<RawDataOutputReceiver>,
-        bridge_ready_signal: BridgeReadySignal,
     ) -> Result<()> {
         let event_loop = self
             .event_loop
             .ok_or_else(|| anyhow::anyhow!("Event loop already consumed"))?;
 
-        event_loop.set_control_flow(ControlFlow::Poll);
+        event_loop.set_control_flow(ControlFlow::Wait);
 
         // Create independent WGPU instance for window
         tracing::info!("Creating independent WGPU instance for window...");
@@ -179,7 +195,7 @@ impl WindowManager {
         let bridge_texture = import_bridge_texture(&wgpu_context.device, bridge_memory_fd)
             .map_err(|e| anyhow::anyhow!("Failed to import bridge texture: {}", e))?;
 
-        let mut app = WindowApp::new(wgpu_context, Some(bridge_texture), frame_receiver, bridge_ready_signal);
+        let mut app = WindowApp::new(wgpu_context, Some(bridge_texture), frame_receiver, self.enable_frame_stats);
         event_loop.run_app(&mut app)?;
 
         Ok(())
@@ -242,15 +258,91 @@ struct BlitPipeline {
     sampler: wgpu::Sampler,
 }
 
+/// Frame timing statistics
+struct FrameStats {
+    last_frame_time: Option<Instant>,
+    frame_count: u64,
+    total_frame_time: f64,
+    min_frame_time: f64,
+    max_frame_time: f64,
+    last_log_time: Instant,
+}
+
+impl FrameStats {
+    fn new() -> Self {
+        Self {
+            last_frame_time: None,
+            frame_count: 0,
+            total_frame_time: 0.0,
+            min_frame_time: f64::MAX,
+            max_frame_time: 0.0,
+            last_log_time: Instant::now(),
+        }
+    }
+
+    /// Record a frame presentation and return the interval since last frame
+    fn record_frame(&mut self, enable_frame_stats: bool) -> Option<f64> {
+        // Early return if stats are disabled
+        if !enable_frame_stats {
+            return None;
+        }
+
+        let now = Instant::now();
+        let interval = self.last_frame_time.map(|last| now.duration_since(last).as_secs_f64());
+
+        if let Some(dt) = interval {
+            self.frame_count += 1;
+            self.total_frame_time += dt;
+            self.min_frame_time = self.min_frame_time.min(dt);
+            self.max_frame_time = self.max_frame_time.max(dt);
+
+            // Log every second
+            if now.duration_since(self.last_log_time).as_secs_f64() >= 1.0 {
+                let avg_frame_time = self.total_frame_time / self.frame_count as f64;
+                let avg_fps = 1.0 / avg_frame_time;
+
+                tracing::info!(
+                    "Frame stats: avg={:.1}fps ({:.2}ms) min={:.2}ms max={:.2}ms count={}",
+                    avg_fps,
+                    avg_frame_time * 1000.0,
+                    self.min_frame_time * 1000.0,
+                    self.max_frame_time * 1000.0,
+                    self.frame_count
+                );
+
+                // Detect irregularities
+                if self.max_frame_time > 2.0 * avg_frame_time {
+                    tracing::warn!(
+                        "Frame time irregularity detected: max frame time ({:.2}ms) is >2x average ({:.2}ms)",
+                        self.max_frame_time * 1000.0,
+                        avg_frame_time * 1000.0
+                    );
+                }
+
+                // Reset stats for next interval
+                self.frame_count = 0;
+                self.total_frame_time = 0.0;
+                self.min_frame_time = f64::MAX;
+                self.max_frame_time = 0.0;
+                self.last_log_time = now;
+            }
+        }
+
+        self.last_frame_time = Some(now);
+        interval
+    }
+}
+
 /// Application handler that manages window lifecycle
 struct WindowApp {
     window: Option<WgpuWindow>,
     wgpu_context: Arc<WgpuContext>,
     bridge_texture: Option<BridgeTextureImport>, // Imported bridge texture from compositor
     #[allow(dead_code)]
-    frame_receiver: Option<Arc<Mutex<RawDataOutputReceiver>>>, // Reserved for future use
-    bridge_ready_signal: BridgeReadySignal, // CPU synchronization signal
+    frame_receiver: Option<RawDataOutputReceiver>, // Reserved for future use
     blit_pipeline: Option<BlitPipeline>,
+    frame_stats: FrameStats, // Frame timing statistics
+    enable_frame_stats: bool,
 }
 
 impl WindowApp {
@@ -258,15 +350,16 @@ impl WindowApp {
         wgpu_context: WgpuContext,
         bridge_texture: Option<BridgeTextureImport>,
         frame_receiver: Option<RawDataOutputReceiver>,
-        bridge_ready_signal: BridgeReadySignal,
+        enable_frame_stats: bool,
     ) -> Self {
         Self {
             window: None,
             wgpu_context: Arc::new(wgpu_context),
             bridge_texture,
-            frame_receiver: frame_receiver.map(|r| Arc::new(Mutex::new(r))),
-            bridge_ready_signal,
+            frame_receiver,
             blit_pipeline: None,
+            frame_stats: FrameStats::new(),
+            enable_frame_stats,
         }
     }
 
@@ -424,54 +517,23 @@ impl WindowApp {
         // Present the frame
         surface_texture.present();
 
+        // Record frame timing
+        if self.enable_frame_stats {
+            let interval = self.frame_stats.record_frame(self.enable_frame_stats);
+            if let Some(dt) = interval {
+                // Log individual frame times if they're unusually long (>50ms gap)
+                if dt > 0.05 {
+                    tracing::warn!("Large frame gap detected: {:.2}ms since last present", dt * 1000.0);
+                }
+            }
+        }
+
         Ok(())
     }
 
-    /// Wait for bridge texture to be ready and render it
-    ///
-    /// The bridge is updated by the compositor in a separate thread.
-    /// This method waits (with timeout) for the signal that a new frame
-    /// has been copied to the bridge texture, then renders it.
-    fn try_render_bridge(&mut self) -> bool {
-        // Check if we have a bridge texture
-        if self.bridge_texture.is_none() {
-            // No bridge texture, nothing to render
-            return false;
-        }
-
-        // Wait for bridge ready signal with timeout
-        // This prevents blocking forever if compositor stops
-        let _timed_out = {
-            let (lock, cvar) = &*self.bridge_ready_signal;
-            let result = cvar.wait_timeout_while(
-                lock.lock().unwrap(),
-                std::time::Duration::from_millis(100), // 100ms timeout
-                |ready| !*ready
-            ).unwrap();
-
-            let (mut ready, timeout_result) = result;
-
-            if timeout_result.timed_out() {
-                // Timeout - will render what we have
-                true
-            } else {
-                // Got signal - reset ready flag
-                *ready = false;
-                false
-            }
-        }; // Lock is dropped here
-
-        // Now we can safely call render_bridge_texture (which needs &mut self)
-        if let Err(e) = self.render_bridge_texture() {
-            tracing::error!("Failed to render bridge texture: {}", e);
-            return false;
-        }
-
-        true
-    }
 }
 
-impl ApplicationHandler for WindowApp {
+impl ApplicationHandler<WindowCommand> for WindowApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
             let window_attributes = Window::default_attributes()
@@ -525,16 +587,26 @@ impl ApplicationHandler for WindowApp {
                 }
             }
             WindowEvent::RedrawRequested => {
-                // Try to render from bridge texture (waits for compositor signal)
-                #[allow(unused_variables)]
-                let frame_was_rendered = self.try_render_bridge();
+                // Render bridge texture if available
+                if self.bridge_texture.is_some() {
+                    if let Err(e) = self.render_bridge_texture() {
+                        tracing::error!("Failed to render bridge texture: {}", e);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 
-                // Always request next redraw to keep polling for frames
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: WindowCommand) {
+        match event {
+            WindowCommand::RequestRedraw => {
+                // Compositor has written a new frame to the bridge texture
+                // Request a redraw to display it
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
             }
-            _ => {}
         }
     }
 }
