@@ -23,12 +23,16 @@ use smelter_core::{
 
 use smelter_render::{
     InputId, OutputId, Resolution,
-    scene::{Component, InputStreamComponent},
+    scene::{
+        Component, InputStreamComponent, RescalerComponent,
+        Position, RescaleMode, HorizontalAlign, VerticalAlign,
+        BorderRadius, RGBAColor,
+    },
 };
 
-use crate::window::WgpuContext;
+use crate::external_memory::{BridgeTextureExport, create_bridge_texture_export};
 
-pub const RESOLUTION: (usize, usize) = (3840, 2160);
+pub const RESOLUTION: (usize, usize) = (1920, 1080);
 const FRAME_RATE: u32 = 30;
 const AUDIO_SAMPLE_RATE: u32 = 48000;
 
@@ -36,12 +40,19 @@ pub struct Compositor {
     _graphics_context: GraphicsContext,
     pipeline: Arc<Mutex<Pipeline>>,
     decklink_inputs: Vec<InputId>,
+    bridge_texture: Option<BridgeTextureExport>,
+}
+
+use std::os::fd::RawFd;
+
+pub struct CompositorContext {
+    pub bridge_memory_fd: RawFd,
 }
 
 impl Compositor {
-    /// Create a new compositor and return both the compositor and the WGPU context
-    /// The WGPU context can be shared with the window manager
-    pub fn new() -> Result<(Self, WgpuContext)> {
+    /// Create a new compositor and return the compositor context with bridge texture FD
+    /// The window manager will create its own WGPU instance and import the bridge texture
+    pub fn new() -> Result<(Self, CompositorContext)> {
         // Initialize graphics context via Smelter
         let graphics_context = GraphicsContext::new(GraphicsContextOptions {
             force_gpu: false,
@@ -58,13 +69,13 @@ impl Compositor {
             panic!("WGPU device error detected: {:?}", error);
         }));
 
-        // Extract WGPU context for sharing with window manager
-        let wgpu_context = WgpuContext {
-            instance: graphics_context.instance.clone(),
-            adapter: graphics_context.adapter.clone(),
-            device: graphics_context.device.clone(),
-            queue: graphics_context.queue.clone(),
-        };
+        // Create bridge texture with external memory for sharing with window
+        tracing::info!("Creating bridge texture with external memory...");
+        let bridge_texture = create_bridge_texture_export(&graphics_context.device)
+            .map_err(|e| anyhow::anyhow!("Failed to create bridge texture: {}", e))?;
+
+        let bridge_memory_fd = bridge_texture.external_handle.memory_fd;
+        tracing::info!("Bridge texture created with FD: {}", bridge_memory_fd);
 
         // Create ChromiumContext for web rendering
         let framerate = Framerate { num: FRAME_RATE, den: 1 };
@@ -160,9 +171,14 @@ impl Compositor {
             _graphics_context: graphics_context,
             pipeline,
             decklink_inputs,
+            bridge_texture: Some(bridge_texture),
         };
 
-        Ok((compositor, wgpu_context))
+        let context = CompositorContext {
+            bridge_memory_fd,
+        };
+
+        Ok((compositor, context))
     }
 
     pub fn start_record(
@@ -200,13 +216,15 @@ impl Compositor {
         Ok(())
     }
 
-    pub fn start_recording(&self, path: PathBuf, duration: Duration, max_decklinks: usize) -> Result<()> {
+    /// Start recording outputs and return the output IDs
+    /// Caller should sleep for desired duration, then call stop_recording()
+    pub fn start_recording_outputs(&self, path: PathBuf, max_decklinks: usize) -> Result<Vec<OutputId>> {
         let num_to_record = std::cmp::min(max_decklinks, self.decklink_inputs.len());
         tracing::info!("Starting recording with {} of {} DeckLink input(s)", num_to_record, self.decklink_inputs.len());
 
         if self.decklink_inputs.is_empty() {
             tracing::warn!("No DeckLink inputs registered - nothing to record!");
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let mut output_ids = Vec::new();
@@ -221,12 +239,11 @@ impl Compositor {
             output_ids.push(output_id);
         }
 
-        tracing::info!("Recording for {:?}", duration);
+        Ok(output_ids)
+    }
 
-        // Wait for the specified duration
-        std::thread::sleep(duration);
-
-        // Stop recording by unregistering outputs
+    /// Stop recording by unregistering the given outputs
+    pub fn stop_recording_outputs(&self, output_ids: Vec<OutputId>) -> Result<()> {
         for output_id in output_ids.iter() {
             self.pipeline.lock().unwrap().unregister_output(output_id).map_err(|e| {
                 anyhow::anyhow!("Failed to unregister recording output: {}", e)
@@ -263,9 +280,29 @@ impl Compositor {
                 audio: None,
             },
             video: Some(RegisterOutputVideoOptions {
-                initial: Component::InputStream(InputStreamComponent {
+                initial: Component::Rescaler(RescalerComponent {
                     id: None,
-                    input_id,
+                    child: Box::new(Component::InputStream(InputStreamComponent {
+                        id: None,
+                        input_id,
+                    })),
+                    position: Position::Static {
+                        width: Some(RESOLUTION.0 as f32),
+                        height: Some(RESOLUTION.1 as f32),
+                    },
+                    transition: None,
+                    mode: RescaleMode::Fill,
+                    horizontal_align: HorizontalAlign::Center,
+                    vertical_align: VerticalAlign::Center,
+                    border_radius: BorderRadius {
+                        top_left: 0.0,
+                        top_right: 0.0,
+                        bottom_right: 0.0,
+                        bottom_left: 0.0,
+                    },
+                    border_width: 0.0,
+                    border_color: RGBAColor(0, 0, 0, 0),
+                    box_shadow: vec![],
                 }),
                 end_condition: PipelineOutputEndCondition::Never,
             }),
@@ -283,4 +320,67 @@ impl Compositor {
 
         Ok(receiver)
     }
+
+    /// Copy a frame from Smelter's output to the bridge texture
+    /// This should be called on the compositor side after receiving a frame
+    pub fn copy_frame_to_bridge(&self, frame_texture: &wgpu::Texture) -> Result<()> {
+        let Some(ref bridge_texture) = self.bridge_texture else {
+            anyhow::bail!("Bridge texture not initialized");
+        };
+
+        // Get the actual size of the incoming frame texture
+        let frame_size = frame_texture.size();
+        let bridge_size = bridge_texture.wgpu_texture.size();
+
+        // Verify the frame size matches the bridge texture
+        if frame_size.width != bridge_size.width || frame_size.height != bridge_size.height {
+            tracing::debug!(
+                "Skipping frame with size {}x{} (bridge texture is {}x{})",
+                frame_size.width,
+                frame_size.height,
+                bridge_size.width,
+                bridge_size.height
+            );
+            return Ok(()); // Skip frames that don't match
+        }
+
+        // Create command encoder
+        let mut encoder = self._graphics_context.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor {
+                label: Some("Bridge Copy Encoder"),
+            },
+        );
+
+        // Copy from Smelter's frame texture to bridge texture
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: frame_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &bridge_texture.wgpu_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            frame_size,
+        );
+
+        // Submit the copy command
+        self._graphics_context.queue.submit(Some(encoder.finish()));
+
+        // Force GPU to complete the copy before returning
+        let _ = self._graphics_context.device.poll(wgpu::MaintainBase::Wait);
+
+        Ok(())
+    }
+
+    /// Get reference to the bridge texture for advanced operations
+    #[allow(dead_code)]
+    pub fn bridge_texture(&self) -> Option<&wgpu::Texture> {
+        self.bridge_texture.as_ref().map(|b| &b.wgpu_texture)
+    }
 }
+

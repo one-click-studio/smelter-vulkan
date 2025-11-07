@@ -4294,14 +4294,19 @@ name = "smelter_vulkan"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ash",
  "crossbeam-channel",
  "decklink",
+ "pollster",
  "smelter-core",
  "smelter-render",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "wgpu",
+ "wgpu-core",
+ "wgpu-hal",
+ "wgpu-types",
  "winit",
 ]
 

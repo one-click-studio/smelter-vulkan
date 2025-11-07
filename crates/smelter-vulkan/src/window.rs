@@ -1,7 +1,7 @@
 use anyhow::Result;
-use smelter_core::{protocols::RawDataOutputReceiver, PipelineEvent};
-use smelter_render::Frame;
-use std::sync::{Arc, Mutex};
+use smelter_core::protocols::RawDataOutputReceiver;
+use std::sync::{Arc, Mutex, Condvar};
+use std::os::fd::RawFd;
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
@@ -10,7 +10,9 @@ use winit::{
     window::{Window, WindowId},
 };
 
-/// Shared WGPU context for rendering
+use crate::external_memory::{BridgeTextureImport, import_bridge_texture};
+
+/// Independent WGPU context for window rendering (separate from Smelter's instance)
 #[derive(Clone)]
 pub struct WgpuContext {
     pub instance: Arc<wgpu::Instance>,
@@ -19,91 +21,65 @@ pub struct WgpuContext {
     pub queue: Arc<wgpu::Queue>,
 }
 
+/// Synchronization primitive for bridge texture readiness (CPU-based)
+pub type BridgeReadySignal = Arc<(Mutex<bool>, Condvar)>;
+
 /// Manages a single window with its surface
 pub struct WgpuWindow {
     window: Arc<Window>,
-    surface: Option<wgpu::Surface<'static>>,
-    surface_configured: bool,
+    surface: wgpu::Surface<'static>,
     wgpu_context: Arc<WgpuContext>,
 }
 
 impl WgpuWindow {
-    /// Create a new window without a surface (lazy initialization)
-    pub fn new(window: Window, wgpu_context: Arc<WgpuContext>) -> Self {
-        Self {
-            window: Arc::new(window),
-            surface: None,
-            surface_configured: false,
+    /// Create a new window with its surface (eager initialization)
+    pub fn new(window: Window, wgpu_context: Arc<WgpuContext>) -> Result<Self> {
+        let window_arc = Arc::new(window);
+
+        // Create and configure surface immediately
+        tracing::info!("Creating WGPU surface");
+        let surface = wgpu_context.instance.create_surface(window_arc.clone())?;
+
+        let size = window_arc.inner_size();
+        if size.width > 0 && size.height > 0 {
+            tracing::info!("Configuring surface: {}x{}", size.width, size.height);
+            configure_surface(&surface, size, &wgpu_context)?;
+        }
+
+        Ok(Self {
+            window: window_arc,
+            surface,
             wgpu_context,
-        }
+        })
     }
 
-    /// Resize the window and configure/create the surface if needed
+    /// Resize the window and reconfigure the surface
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
-        match &self.surface {
-            None => {
-                // Create the surface on first resize (which always fires when window is created)
-                tracing::info!("Creating WGPU surface on first resize");
-                match self.wgpu_context.instance.create_surface(self.window.clone()) {
-                    Ok(surface) => {
-                        self.surface = Some(surface);
-                        // Note: Surface is NOT configured here - it will be configured
-                        // on first call to get_surface_texture()
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to create surface: {}", e);
-                    }
-                }
-            }
-            Some(surface) => {
-                // Only reconfigure if surface was already configured and size changed
-                if self.surface_configured && new_size.width > 0 && new_size.height > 0 {
-                    if let Err(e) = configure_surface(surface, new_size, &self.wgpu_context) {
-                        tracing::error!("Failed to reconfigure surface on resize: {}", e);
-                    }
-                }
+        if new_size.width > 0 && new_size.height > 0 {
+            if let Err(e) = configure_surface(&self.surface, new_size, &self.wgpu_context) {
+                tracing::error!("Failed to reconfigure surface on resize: {}", e);
             }
         }
-    }
-
-    /// Check if the window is ready for rendering
-    /// Returns true only after the surface has been created (on first resize)
-    pub fn is_ready(&self) -> bool {
-        self.surface.is_some()
     }
 
     /// Get the current surface texture, handling errors and suboptimal surfaces
     pub fn get_surface_texture(&mut self) -> Result<wgpu::SurfaceTexture> {
-        let surface = self.surface.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Window is not ready to display textures yet"))?;
-
-        // Configure the surface on first access (lazy configuration)
-        // This is done here rather than in resize() to avoid Vulkan swapchain errors
-        if !self.surface_configured {
-            let size = self.window.inner_size();
-            if size.width > 0 && size.height > 0 {
-                tracing::info!("Configuring surface on first texture access: {}x{}", size.width, size.height);
-                configure_surface(surface, size, &self.wgpu_context)?;
-                self.surface_configured = true;
-            }
-        }
-
         // Try to get the current texture
-        let mut texture = match surface.get_current_texture() {
+        let mut texture = match self.surface.get_current_texture() {
             Ok(texture) => texture,
             Err(wgpu::SurfaceError::Outdated) => {
                 // Surface is outdated, reconfigure and retry
                 tracing::warn!("Outdated WGPU Surface detected, recreating it");
                 let size = self.window.inner_size();
-                configure_surface(surface, size, &self.wgpu_context)?;
-                surface.get_current_texture()?
+                configure_surface(&self.surface, size, &self.wgpu_context)?;
+                self.surface.get_current_texture()?
             }
             Err(wgpu::SurfaceError::Lost) => {
                 // Surface is lost, reconfigure and retry
                 tracing::warn!("Lost WGPU Surface detected, recreating it");
                 let size = self.window.inner_size();
-                configure_surface(surface, size, &self.wgpu_context)?;
-                surface.get_current_texture()?
+                configure_surface(&self.surface, size, &self.wgpu_context)?;
+                self.surface.get_current_texture()?
             }
             Err(e) => return Err(anyhow::anyhow!("Failed to get surface texture: {}", e)),
         };
@@ -113,8 +89,8 @@ impl WgpuWindow {
             tracing::warn!("Sub-optimal WGPU Surface detected, recreating it");
             drop(texture);
             let size = self.window.inner_size();
-            configure_surface(surface, size, &self.wgpu_context)?;
-            texture = surface.get_current_texture()?;
+            configure_surface(&self.surface, size, &self.wgpu_context)?;
+            texture = self.surface.get_current_texture()?;
         }
 
         Ok(texture)
@@ -148,15 +124,13 @@ fn configure_surface(
         format: surface_format,
         width: size.width,
         height: size.height,
-        present_mode: wgpu::PresentMode::AutoNoVsync,
+        present_mode: wgpu::PresentMode::AutoVsync,
         desired_maximum_frame_latency: 1,
         alpha_mode: wgpu::CompositeAlphaMode::Auto,
         view_formats: vec![],
     };
 
     surface.configure(&wgpu_context.device, &surface_config);
-    tracing::info!("Configured surface: {}x{}, format: {:?}, present_mode: {:?}",
-        size.width, size.height, surface_format, surface_config.present_mode);
     Ok(())
 }
 
@@ -176,15 +150,19 @@ impl WindowManager {
         })
     }
 
-    /// Run the window event loop with the provided WGPU context and frame receiver
+    /// Run the window event loop with bridge texture FD and frame receiver
+    ///
+    /// Creates an independent WGPU instance and imports the bridge texture
+    /// using the provided file descriptor from the compositor.
     ///
     /// The receiver contains frames from the compositor with bounded(1) backpressure.
     /// The window will only redraw when frames are available, and consuming a frame
     /// allows the compositor to produce the next one.
     pub fn run(
         self,
-        wgpu_context: WgpuContext,
+        bridge_memory_fd: RawFd,
         frame_receiver: Option<RawDataOutputReceiver>,
+        bridge_ready_signal: BridgeReadySignal,
     ) -> Result<()> {
         let event_loop = self
             .event_loop
@@ -192,10 +170,68 @@ impl WindowManager {
 
         event_loop.set_control_flow(ControlFlow::Poll);
 
-        let mut app = WindowApp::new(wgpu_context, frame_receiver);
+        // Create independent WGPU instance for window
+        tracing::info!("Creating independent WGPU instance for window...");
+        let wgpu_context = Self::create_wgpu_context()?;
+
+        // Import bridge texture from file descriptor
+        tracing::info!("Importing bridge texture from FD: {}", bridge_memory_fd);
+        let bridge_texture = import_bridge_texture(&wgpu_context.device, bridge_memory_fd)
+            .map_err(|e| anyhow::anyhow!("Failed to import bridge texture: {}", e))?;
+
+        let mut app = WindowApp::new(wgpu_context, Some(bridge_texture), frame_receiver, bridge_ready_signal);
         event_loop.run_app(&mut app)?;
 
         Ok(())
+    }
+
+    /// Create an independent WGPU context (instance, adapter, device, queue)
+    fn create_wgpu_context() -> Result<WgpuContext> {
+        // Create WGPU instance
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..Default::default()
+        });
+
+        // Request adapter
+        let adapter_result = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }));
+
+        let adapter = adapter_result.map_err(|e| anyhow::anyhow!("Failed to request adapter: {:?}", e))?;
+
+        tracing::info!(
+            "Window using GPU: {:?} ({:?})",
+            adapter.get_info().name,
+            adapter.get_info().backend
+        );
+
+        // Request device and queue
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("Window Device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::default(),
+                trace: wgpu_types::Trace::Off,
+            },
+        ))
+        .map_err(|e| anyhow::anyhow!("Failed to create device: {}", e))?;
+
+        // Set up device error handler
+        device.on_uncaptured_error(Box::new(|error| {
+            tracing::error!("Window WGPU Device Error: {:?}", error);
+            panic!("Window WGPU device error detected: {:?}", error);
+        }));
+
+        Ok(WgpuContext {
+            instance: Arc::new(instance),
+            adapter: Arc::new(adapter),
+            device: Arc::new(device),
+            queue: Arc::new(queue),
+        })
     }
 }
 
@@ -210,19 +246,27 @@ struct BlitPipeline {
 struct WindowApp {
     window: Option<WgpuWindow>,
     wgpu_context: Arc<WgpuContext>,
-    frame_receiver: Option<Arc<Mutex<RawDataOutputReceiver>>>,
+    bridge_texture: Option<BridgeTextureImport>, // Imported bridge texture from compositor
+    #[allow(dead_code)]
+    frame_receiver: Option<Arc<Mutex<RawDataOutputReceiver>>>, // Reserved for future use
+    bridge_ready_signal: BridgeReadySignal, // CPU synchronization signal
     blit_pipeline: Option<BlitPipeline>,
-    pending_frame: Option<smelter_render::Frame>, // Frame being rendered (holds channel slot)
 }
 
 impl WindowApp {
-    fn new(wgpu_context: WgpuContext, frame_receiver: Option<RawDataOutputReceiver>) -> Self {
+    fn new(
+        wgpu_context: WgpuContext,
+        bridge_texture: Option<BridgeTextureImport>,
+        frame_receiver: Option<RawDataOutputReceiver>,
+        bridge_ready_signal: BridgeReadySignal,
+    ) -> Self {
         Self {
             window: None,
             wgpu_context: Arc::new(wgpu_context),
+            bridge_texture,
             frame_receiver: frame_receiver.map(|r| Arc::new(Mutex::new(r))),
+            bridge_ready_signal,
             blit_pipeline: None,
-            pending_frame: None,
         }
     }
 
@@ -304,29 +348,21 @@ impl WindowApp {
         }
     }
 
-    /// Render a frame from the compositor to the window surface
-    fn render_frame(&mut self, frame: Frame) -> Result<()> {
+    /// Render the bridge texture to the window surface
+    /// This is called when the bridge is ready (compositor has copied a frame)
+    fn render_bridge_texture(&mut self) -> Result<()> {
         let window = self
             .window
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Window not created yet"))?;
 
-        if !window.is_ready() {
-            return Ok(()); // Window not ready, skip frame
-        }
+        let bridge_texture = self
+            .bridge_texture
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Bridge texture not available"))?;
 
         // Get the surface texture
         let surface_texture = window.get_surface_texture()?;
-
-        // Get the frame's WGPU texture
-        let frame_texture = match &frame.data {
-            smelter_render::FrameData::Rgba8UnormWgpuTexture(texture) => texture,
-            _ => {
-                tracing::error!("Unexpected frame format (not Rgba8UnormWgpuTexture)");
-                surface_texture.present();
-                return Ok(());
-            }
-        };
 
         // Create blit pipeline if not already created
         if self.blit_pipeline.is_none() {
@@ -336,10 +372,10 @@ impl WindowApp {
 
         let blit = self.blit_pipeline.as_ref().unwrap();
 
-        // Create bind group for this frame's texture
-        let frame_view = frame_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // Create bind group for bridge texture
+        let bridge_view = bridge_texture.wgpu_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = self.wgpu_context.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Frame Blit Bind Group"),
+            label: Some("Bridge Blit Bind Group"),
             layout: &blit.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -348,22 +384,22 @@ impl WindowApp {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&frame_view),
+                    resource: wgpu::BindingResource::TextureView(&bridge_view),
                 },
             ],
         });
 
-        // Render the frame using a fullscreen blit
+        // Render the bridge texture using a fullscreen blit
         let surface_view = surface_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.wgpu_context.device.create_command_encoder(
             &wgpu::CommandEncoderDescriptor {
-                label: Some("Frame Blit Encoder"),
+                label: Some("Bridge Blit Encoder"),
             },
         );
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Frame Blit Pass"),
+                label: Some("Bridge Blit Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &surface_view,
                     resolve_target: None,
@@ -391,53 +427,47 @@ impl WindowApp {
         Ok(())
     }
 
-    /// Render pending frame and fetch next frame from channel
+    /// Wait for bridge texture to be ready and render it
     ///
-    /// With bounded(1) channels, this provides backpressure synchronization:
-    /// 1. Render the pending_frame (if any) while holding the channel slot
-    /// 2. After rendering, drop pending_frame to free the channel slot
-    /// 3. Fetch next frame and store in pending_frame (blocks smelter until we render it)
-    fn try_render_from_channel(&mut self) -> bool {
-        // Step 1: Render the pending frame if we have one
-        if let Some(frame) = self.pending_frame.take() {
-            if let Err(e) = self.render_frame(frame) {
-                tracing::error!("Failed to render frame: {}", e);
-            }
-            // pending_frame is now None, freeing the channel slot
+    /// The bridge is updated by the compositor in a separate thread.
+    /// This method waits (with timeout) for the signal that a new frame
+    /// has been copied to the bridge texture, then renders it.
+    fn try_render_bridge(&mut self) -> bool {
+        // Check if we have a bridge texture
+        if self.bridge_texture.is_none() {
+            // No bridge texture, nothing to render
+            return false;
         }
 
-        // Step 2: Try to fetch the next frame from the channel
-        let receiver = match &self.frame_receiver {
-            Some(r) => r,
-            None => return false,
-        };
+        // Wait for bridge ready signal with timeout
+        // This prevents blocking forever if compositor stops
+        let _timed_out = {
+            let (lock, cvar) = &*self.bridge_ready_signal;
+            let result = cvar.wait_timeout_while(
+                lock.lock().unwrap(),
+                std::time::Duration::from_millis(100), // 100ms timeout
+                |ready| !*ready
+            ).unwrap();
 
-        let receiver_guard = receiver.lock().unwrap();
-        let video_receiver = match &receiver_guard.video {
-            Some(r) => r,
-            None => return false,
-        };
+            let (mut ready, timeout_result) = result;
 
-        // Non-blocking receive for the next frame
-        match video_receiver.try_recv() {
-            Ok(event) => {
-                match event {
-                    PipelineEvent::Data(frame) => {
-                        // Store frame in pending_frame (holds channel slot)
-                        self.pending_frame = Some(frame);
-                        true // Frame is now pending
-                    }
-                    PipelineEvent::EOS => {
-                        tracing::info!("End of stream received");
-                        false
-                    }
-                }
-            }
-            Err(_) => {
-                // No new frame available
+            if timeout_result.timed_out() {
+                // Timeout - will render what we have
+                true
+            } else {
+                // Got signal - reset ready flag
+                *ready = false;
                 false
             }
+        }; // Lock is dropped here
+
+        // Now we can safely call render_bridge_texture (which needs &mut self)
+        if let Err(e) = self.render_bridge_texture() {
+            tracing::error!("Failed to render bridge texture: {}", e);
+            return false;
         }
+
+        true
     }
 }
 
@@ -451,13 +481,25 @@ impl ApplicationHandler for WindowApp {
             match event_loop.create_window(window_attributes) {
                 Ok(window) => {
                     tracing::info!("Window created successfully");
-                    // Surface is NOT created yet - will be created on first resize
-                    let wgpu_window = WgpuWindow::new(window, self.wgpu_context.clone());
 
-                    // Request initial redraw to start frame polling
-                    wgpu_window.request_redraw();
+                    // Create window with surface (eager initialization)
+                    match WgpuWindow::new(window, self.wgpu_context.clone()) {
+                        Ok(wgpu_window) => {
+                            tracing::info!("Surface created and configured");
 
-                    self.window = Some(wgpu_window);
+                            // Create blit pipeline now that we have the surface format
+                            // Note: We'll still create it lazily on first frame since we need the actual surface texture format
+                            // This is kept as-is to maintain the same behavior
+
+                            // Request initial redraw to start frame polling
+                            wgpu_window.request_redraw();
+
+                            self.window = Some(wgpu_window);
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to create window surface: {}", e);
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::error!("Failed to create window: {}", e);
@@ -479,14 +521,13 @@ impl ApplicationHandler for WindowApp {
             }
             WindowEvent::Resized(new_size) => {
                 if let Some(window) = &mut self.window {
-                    tracing::debug!("Window resized to {}x{}", new_size.width, new_size.height);
                     window.resize(new_size);
                 }
             }
             WindowEvent::RedrawRequested => {
-                // Try to render from channel - only renders if frame is available
+                // Try to render from bridge texture (waits for compositor signal)
                 #[allow(unused_variables)]
-                let frame_was_rendered = self.try_render_from_channel();
+                let frame_was_rendered = self.try_render_bridge();
 
                 // Always request next redraw to keep polling for frames
                 if let Some(window) = &self.window {

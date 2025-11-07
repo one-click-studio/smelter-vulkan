@@ -3,6 +3,7 @@ use std::{fs, path::Path, thread};
 
 #[cfg(target_os = "linux")]
 mod compositor;
+mod external_memory;
 mod window;
 
 const RECORDING_DURATION_SECS: u64 = 60;
@@ -69,15 +70,22 @@ fn main() -> Result<()> {
 
     #[cfg(target_os = "linux")]
     {
-        // Step 2: Initialize Compositor and extract WGPU context
-        tracing::info!("Step 2: Creating Compositor and initializing WGPU via Smelter");
-        let (compositor, wgpu_context) = compositor::Compositor::new()?;
+        use std::sync::{Arc, Mutex, Condvar};
 
-        // Step 3: Register window preview output with bounded(1) channel (if we have inputs)
+        // Step 2: Initialize Compositor with bridge texture
+        tracing::info!("Step 2: Creating Compositor with bridge texture");
+        let (compositor, compositor_context) = compositor::Compositor::new()?;
+
+        // Step 3: Create synchronization primitive for bridge texture
+        tracing::info!("Step 3: Creating bridge synchronization signal");
+        let bridge_ready_signal: window::BridgeReadySignal = Arc::new((Mutex::new(false), Condvar::new()));
+        let bridge_ready_clone = bridge_ready_signal.clone();
+
+        // Step 4: Register window preview output with bounded(1) channel (if we have inputs)
         let frame_receiver = if let Some(input_id) = compositor.first_decklink_input() {
-            tracing::info!("Step 3a: Registering window preview output with bounded(1) channel");
-            let output_id = smelter_render::OutputId(std::sync::Arc::from("window_preview"));
-            match compositor.register_window_preview_output(output_id, input_id) {
+            tracing::info!("Step 4: Registering window preview output");
+            let output_id = smelter_render::OutputId(Arc::from("window_preview"));
+            match compositor.register_window_preview_output(output_id, input_id.clone()) {
                 Ok(receiver) => {
                     tracing::info!("Window preview output registered successfully");
                     Some(receiver)
@@ -92,39 +100,104 @@ fn main() -> Result<()> {
             None
         };
 
-        // Step 4: Start recording in a separate thread (with 5 second delay for pipeline stabilization)
-        thread::spawn(move || -> Result<()> {
-            // Wait 5 seconds for pipeline to stabilize before starting recording
-            thread::sleep(std::time::Duration::from_secs(5));
+        // Step 5: Start frame copy loop in separate thread
+        // This receives frames from Smelter and copies them to the bridge texture
+        if let Some(ref receiver) = frame_receiver {
+            let receiver_clone = Arc::new(Mutex::new(receiver.clone()));
+            let compositor_ref = Arc::new(Mutex::new(compositor));
+            let compositor_clone = compositor_ref.clone();
 
-            let folder_path = "./recordings/".into();
-            std::fs::create_dir_all(&folder_path)?;
+            thread::spawn(move || {
+                tracing::info!("Frame copy loop started");
+                loop {
+                    // Receive frame from Smelter
+                    let frame = {
+                        let receiver_guard = receiver_clone.lock().unwrap();
+                        match &receiver_guard.video {
+                            Some(video_rx) => match video_rx.recv() {
+                                Ok(smelter_core::PipelineEvent::Data(frame)) => Some(frame),
+                                Ok(smelter_core::PipelineEvent::EOS) => {
+                                    tracing::info!("End of stream in copy loop");
+                                    break;
+                                }
+                                Err(e) => {
+                                    tracing::error!("Error receiving frame: {}", e);
+                                    break;
+                                }
+                            },
+                            None => {
+                                tracing::warn!("No video receiver in copy loop");
+                                break;
+                            }
+                        }
+                    };
 
-            compositor.start_recording(
-                folder_path,
-                std::time::Duration::from_secs(RECORDING_DURATION_SECS),
-                MAX_DECKLINKS_TO_RECORD,
-            )?;
+                    if let Some(frame) = frame {
+                        // Extract texture from frame
+                        if let smelter_render::FrameData::Rgba8UnormWgpuTexture(texture) = &frame.data {
+                            // Copy to bridge texture
+                            let comp = compositor_clone.lock().unwrap();
+                            if let Err(e) = comp.copy_frame_to_bridge(texture) {
+                                tracing::error!("Failed to copy frame to bridge: {}", e);
+                                continue;
+                            }
 
-            Ok(())
-        });
+                            // Signal window that bridge is ready
+                            let (lock, cvar) = &*bridge_ready_clone;
+                            let mut ready = lock.lock().unwrap();
+                            *ready = true;
+                            cvar.notify_one();
+                            drop(ready);
+                        }
+                    }
+                }
+                tracing::info!("Frame copy loop exited");
+            });
 
-        // Step 5: Run window event loop with shared WGPU context and frame receiver (blocking)
-        tracing::info!("Step 5: Starting window manager event loop");
-        window_manager.run(wgpu_context, frame_receiver)?;
+            // Step 6: Start recording in a separate thread
+            thread::spawn(move || -> Result<()> {
+                // Wait 5 seconds for pipeline to stabilize
+                thread::sleep(std::time::Duration::from_secs(5));
+
+                let folder_path = "./recordings/".into();
+                std::fs::create_dir_all(&folder_path)?;
+
+                // Start recording outputs (acquire lock briefly, then release)
+                let output_ids = {
+                    let comp = compositor_ref.lock().unwrap();
+                    comp.start_recording_outputs(folder_path, MAX_DECKLINKS_TO_RECORD)?
+                }; // Lock dropped here
+
+                // Sleep for recording duration WITHOUT holding the lock
+                tracing::info!("Recording for {} seconds", RECORDING_DURATION_SECS);
+                thread::sleep(std::time::Duration::from_secs(RECORDING_DURATION_SECS));
+
+                // Stop recording (acquire lock briefly again)
+                {
+                    let comp = compositor_ref.lock().unwrap();
+                    comp.stop_recording_outputs(output_ids)?;
+                }
+
+                Ok(())
+            });
+        }
+
+        // Step 7: Run window event loop with bridge texture FD (blocking)
+        tracing::info!("Step 7: Starting window manager event loop with bridge texture");
+        window_manager.run(
+            compositor_context.bridge_memory_fd,
+            None, // Don't pass frame_receiver to window anymore
+            bridge_ready_signal,
+        )?;
     }
 
     #[cfg(not(target_os = "linux"))]
     {
+        use std::sync::{Arc, Mutex, Condvar};
+
         tracing::warn!("Compositor is only supported on Linux.");
-        // Still run the window manager, but without compositor
-        let wgpu_context = window::WgpuContext {
-            instance: std::sync::Arc::new(wgpu::Instance::new(wgpu::InstanceDescriptor::default())),
-            adapter: std::sync::Arc::new(unsafe { std::mem::zeroed() }), // Dummy adapter
-            device: std::sync::Arc::new(unsafe { std::mem::zeroed() }),   // Dummy device
-            queue: std::sync::Arc::new(unsafe { std::mem::zeroed() }),    // Dummy queue
-        };
-        window_manager.run(wgpu_context, None)?;
+        tracing::error!("This application requires Linux with DeckLink and Vulkan video support");
+        anyhow::bail!("Unsupported platform - Linux required");
     }
 
     Ok(())
