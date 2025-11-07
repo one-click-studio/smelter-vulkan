@@ -8,7 +8,8 @@ mod window;
 
 const RECORDING_DURATION_SECS: u64 = 60;
 const MAX_DECKLINKS_TO_RECORD: usize = 3;
-const ENABLE_FRAME_STATS: bool = false;
+const ENABLE_FRAME_STATS: bool = true;
+const WINDOW_FPS: f64 = 60.0;
 
 /// Clean up existing .mp4 files in the recordings directory
 fn cleanup() -> Result<()> {
@@ -67,7 +68,7 @@ fn main() -> Result<()> {
     // Step 1: Create WindowManager FIRST (REQUIRED before WGPU/Compositor)
     // This initializes the winit event loop which must exist before graphics
     tracing::info!("Step 1: Creating WindowManager (MUST be first)");
-    let window_manager = window::WindowManager::new(ENABLE_FRAME_STATS)?;
+    let window_manager = window::WindowManager::new(ENABLE_FRAME_STATS, WINDOW_FPS)?;
 
     // Get the event loop proxy for sending commands to the window
     let window_proxy = window_manager.proxy()

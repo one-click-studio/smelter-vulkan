@@ -2,7 +2,7 @@ use anyhow::Result;
 use smelter_core::protocols::RawDataOutputReceiver;
 use std::sync::Arc;
 use std::os::fd::RawFd;
-use std::time::Instant;
+use std::time::{Instant, Duration};
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
@@ -148,18 +148,20 @@ pub struct WindowManager {
     event_loop: Option<EventLoop<WindowCommand>>,
     proxy: Option<WindowCommandProxy>,
     enable_frame_stats: bool,
+    target_fps: f64,
 }
 
 impl WindowManager {
     /// Create a new WindowManager with an event loop
     /// CRITICAL: This MUST be called before WGPU/Compositor initialization
-    pub fn new(enable_frame_stats: bool) -> Result<Self> {
+    pub fn new(enable_frame_stats: bool, target_fps: f64) -> Result<Self> {
         let event_loop = EventLoop::<WindowCommand>::with_user_event().build()?;
         let proxy = event_loop.create_proxy();
         Ok(Self {
             event_loop: Some(event_loop),
             proxy: Some(proxy),
             enable_frame_stats,
+            target_fps,
         })
     }
 
@@ -173,8 +175,7 @@ impl WindowManager {
     /// Creates an independent WGPU instance and imports the bridge texture
     /// using the provided file descriptor from the compositor.
     ///
-    /// Redraw requests are triggered via the EventLoopProxy when the compositor
-    /// has written a new frame to the bridge texture.
+    /// The event loop runs at a fixed frame rate using ControlFlow::WaitUntil.
     pub fn run(
         self,
         bridge_memory_fd: RawFd,
@@ -183,8 +184,6 @@ impl WindowManager {
         let event_loop = self
             .event_loop
             .ok_or_else(|| anyhow::anyhow!("Event loop already consumed"))?;
-
-        event_loop.set_control_flow(ControlFlow::Wait);
 
         // Create independent WGPU instance for window
         tracing::info!("Creating independent WGPU instance for window...");
@@ -195,7 +194,19 @@ impl WindowManager {
         let bridge_texture = import_bridge_texture(&wgpu_context.device, bridge_memory_fd)
             .map_err(|e| anyhow::anyhow!("Failed to import bridge texture: {}", e))?;
 
-        let mut app = WindowApp::new(wgpu_context, Some(bridge_texture), frame_receiver, self.enable_frame_stats);
+        let target_frame_duration = Duration::from_secs_f64(1.0 / self.target_fps);
+        tracing::info!("Window manager configured for {:.1} FPS (frame duration: {:.2}ms)",
+            self.target_fps,
+            target_frame_duration.as_secs_f64() * 1000.0);
+
+        let mut app = WindowApp::new(
+            wgpu_context,
+            Some(bridge_texture),
+            frame_receiver,
+            self.enable_frame_stats,
+            target_frame_duration,
+        );
+
         event_loop.run_app(&mut app)?;
 
         Ok(())
@@ -343,6 +354,8 @@ struct WindowApp {
     blit_pipeline: Option<BlitPipeline>,
     frame_stats: FrameStats, // Frame timing statistics
     enable_frame_stats: bool,
+    target_frame_duration: Duration, // Target duration between frames
+    next_frame_time: Instant, // Next scheduled frame time
 }
 
 impl WindowApp {
@@ -351,6 +364,7 @@ impl WindowApp {
         bridge_texture: Option<BridgeTextureImport>,
         frame_receiver: Option<RawDataOutputReceiver>,
         enable_frame_stats: bool,
+        target_frame_duration: Duration,
     ) -> Self {
         Self {
             window: None,
@@ -360,6 +374,8 @@ impl WindowApp {
             blit_pipeline: None,
             frame_stats: FrameStats::new(),
             enable_frame_stats,
+            target_frame_duration,
+            next_frame_time: Instant::now(),
         }
     }
 
@@ -549,14 +565,11 @@ impl ApplicationHandler<WindowCommand> for WindowApp {
                         Ok(wgpu_window) => {
                             tracing::info!("Surface created and configured");
 
-                            // Create blit pipeline now that we have the surface format
-                            // Note: We'll still create it lazily on first frame since we need the actual surface texture format
-                            // This is kept as-is to maintain the same behavior
-
-                            // Request initial redraw to start frame polling
-                            wgpu_window.request_redraw();
-
                             self.window = Some(wgpu_window);
+
+                            // Initialize the frame timing for the event loop
+                            self.next_frame_time = Instant::now() + self.target_frame_duration;
+                            event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame_time));
                         }
                         Err(e) => {
                             tracing::error!("Failed to create window surface: {}", e);
@@ -567,6 +580,21 @@ impl ApplicationHandler<WindowCommand> for WindowApp {
                     tracing::error!("Failed to create window: {}", e);
                 }
             }
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Check if it's time for the next frame
+        let now = Instant::now();
+        if now >= self.next_frame_time {
+            // Request redraw
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+
+            // Schedule next frame
+            self.next_frame_time += self.target_frame_duration;
+            event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame_time));
         }
     }
 
@@ -602,10 +630,8 @@ impl ApplicationHandler<WindowCommand> for WindowApp {
         match event {
             WindowCommand::RequestRedraw => {
                 // Compositor has written a new frame to the bridge texture
-                // Request a redraw to display it
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
+                // Note: Actual redraw is triggered by the fixed-rate timer in RedrawRequested
+                // This event is kept for compatibility but doesn't trigger immediate redraws
             }
         }
     }
