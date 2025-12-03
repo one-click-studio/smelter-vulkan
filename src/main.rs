@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-#[cfg(target_os = "linux")]
+mod assets;
 mod compositor;
 
 const RECORDING_DURATION_SECS: u64 = 600;
@@ -11,19 +11,13 @@ fn main() -> Result<()> {
         .with_env_filter("error,smelter_vulkan=info")
         .init();
 
-    #[cfg(target_os = "linux")]
-    {
-        let compositor = compositor::Compositor::new()?;
+    let input_path = assets::download_input_asset()?;
+    let compositor = compositor::Compositor::new(input_path)?;
 
-        let folder_path = "./recordings/".into();
-        std::fs::create_dir_all(&folder_path)?;
+    let folder_path = "./recordings/".into();
+    std::fs::create_dir_all(&folder_path)?;
 
-        compositor.start_recording(folder_path, std::time::Duration::from_secs(RECORDING_DURATION_SECS))?;
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        println!("Test is only supported on Linux.");
-    }
+    compositor.start_recording(folder_path, std::time::Duration::from_secs(RECORDING_DURATION_SECS))?;
 
     Ok(())
 }

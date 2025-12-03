@@ -5,10 +5,10 @@ edition = "2024"
 
 [dependencies]
 # Compositor integration
-smelter-core = { git = "https://github.com/software-mansion/smelter.git", tag = "v0.5.0" }
-smelter-render = { git = "https://github.com/software-mansion/smelter.git", tag = "v0.5.0", features = [
-    "web-renderer",
+smelter-core = { git = "https://github.com/software-mansion/smelter.git", tag = "v0.5.0", features = [
+    "vk-video",
 ] }
+smelter-render = { git = "https://github.com/software-mansion/smelter.git", tag = "v0.5.0" }
 # Runtime
 tokio = { version = "1", features = ["full"] }
 # Graphics (required by compositor)
@@ -17,11 +17,5 @@ wgpu = "25.0.2"
 anyhow = "1.0.99"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-# DeckLink is only supported on Linux
-smelter-core = { git = "https://github.com/software-mansion/smelter.git", tag = "v0.5.0", features = [
-    "decklink",
-    "vk-video",
-] }
-decklink = { git = "https://github.com/software-mansion/smelter.git", tag = "v0.5.0" }
+# HTTP client for asset downloads
+reqwest = { version = "0.12", features = ["blocking"] }
