@@ -5,8 +5,8 @@ edition = "2024"
 
 [dependencies]
 # Compositor integration
-smelter-core = { git = "https://github.com/software-mansion/smelter.git", rev = "005137d" }
-smelter-render = { git = "https://github.com/software-mansion/smelter.git", rev = "005137d", features = [
+smelter-core = { git = "https://github.com/software-mansion/smelter.git", tag = "v0.5.0" }
+smelter-render = { git = "https://github.com/software-mansion/smelter.git", tag = "v0.5.0", features = [
     "web-renderer",
 ] }
 # Runtime
@@ -20,8 +20,8 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # DeckLink is only supported on Linux
-smelter-core = { git = "https://github.com/software-mansion/smelter.git", rev = "005137d", features = [
+smelter-core = { git = "https://github.com/software-mansion/smelter.git", tag = "v0.5.0", features = [
     "decklink",
     "vk-video",
 ] }
-decklink = { git = "https://github.com/software-mansion/smelter.git", rev = "005137d" }
+decklink = { git = "https://github.com/software-mansion/smelter.git", tag = "v0.5.0" }

@@ -37,6 +37,8 @@ impl Compositor {
     pub fn new() -> Result<Self> {
         // Initialize graphics context
         let graphics_context = GraphicsContext::new(GraphicsContextOptions {
+            device_id: None,
+            driver_name: None,
             force_gpu: false,
             features: wgpu::Features::empty(),
             limits: wgpu::Limits::default(),
@@ -148,6 +150,7 @@ impl Compositor {
                     bitrate: None,
                 })),
                 audio: None,
+                raw_options: vec![],
             }),
             video: Some(RegisterOutputVideoOptions {
                 initial: Component::InputStream(InputStreamComponent {

@@ -41,7 +41,7 @@ The codebase is structured around a compositor abstraction that wraps the Smelte
 
 ### External Dependencies
 
-- **Smelter libraries** (`smelter-core`, `smelter-render`, `decklink`): Pinned to revision `005137d` from the Software Mansion Smelter repository
+- **Smelter libraries** (`smelter-core`, `smelter-render`, `decklink`): Pinned to tag `v0.5.0` from the Software Mansion Smelter repository
   - `smelter-core`: Provides the core compositor functionality with DeckLink feature enabled
   - `smelter-render`: Provides rendering capabilities with web-renderer feature enabled
   - `decklink`: Optional DeckLink hardware integration
