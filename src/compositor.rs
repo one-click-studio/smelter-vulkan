@@ -100,12 +100,7 @@ impl Compositor {
         })
     }
 
-    pub fn start_record(
-        &self,
-        path: PathBuf,
-        output_id: OutputId,
-        input_id: InputId,
-    ) -> Result<()> {
+    pub fn start_record(&self, path: PathBuf, output_id: OutputId) -> Result<()> {
         // Configure MP4 output with H.264 video and AAC audio
         let output_options = RegisterOutputOptions {
             output_options: ProtocolOutputOptions::Mp4(Mp4OutputOptions {
@@ -121,7 +116,10 @@ impl Compositor {
                 raw_options: vec![],
             }),
             video: Some(RegisterOutputVideoOptions {
-                initial: Component::InputStream(InputStreamComponent { id: None, input_id }),
+                initial: Component::InputStream(InputStreamComponent {
+                    id: None,
+                    input_id: self.input_id.clone(),
+                }),
                 end_condition: PipelineOutputEndCondition::AnyInput,
             }),
             audio: None,
@@ -131,35 +129,18 @@ impl Compositor {
         Pipeline::register_output(&self.pipeline, output_id.clone(), output_options)
             .map_err(|e| anyhow::anyhow!("Failed to register recording output: {}", e))?;
 
-        tracing::info!("Recording {:?} at {:?}", output_id, path);
+        tracing::info!("Starting recording {:?} at {:?}", output_id, path);
 
         Ok(())
     }
 
-    pub fn start_recording(&self, path: PathBuf, duration: Duration) -> Result<()> {
-        tracing::info!("Starting recording");
-
-        let output_id = OutputId(Arc::from("recording_output"));
-        self.start_record(
-            path.join("recording.mp4"),
-            output_id.clone(),
-            self.input_id.clone(),
-        )?;
-
-        tracing::info!("Recording for {:?}", duration);
-
-        // Wait for the specified duration
-        std::thread::sleep(duration);
-
-        // Stop recording by unregistering output
+    pub fn stop_record(&self, output_id: OutputId) -> Result<()> {
         self.pipeline
             .lock()
             .unwrap()
             .unregister_output(&output_id)
             .map_err(|e| anyhow::anyhow!("Failed to unregister recording output: {}", e))?;
-
-        std::thread::sleep(Duration::from_millis(500));
-        tracing::info!("Recording completed");
+        tracing::info!("Stopped recording {:?}", output_id);
         Ok(())
     }
 }
