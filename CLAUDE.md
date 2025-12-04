@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a Rust project that integrates with the Smelter compositor framework for DeckLink audio/video processing. The project uses `smelter-core` and `smelter-render` as external dependencies from the Software Mansion Smelter repository.
+This is a Rust project that integrates with the Smelter compositor framework for video processing. The project uses `smelter-core` and `smelter-render` as external dependencies from the Software Mansion Smelter repository.
 
 ## Build Commands
 
@@ -25,37 +25,33 @@ This is a Rust project that integrates with the Smelter compositor framework for
 
 The codebase is structured around a compositor abstraction that wraps the Smelter framework:
 
-- **`src/main.rs`**: Entry point that initializes tracing/logging and creates a `Compositor` instance. The logging configuration filters out verbose output from `compositor_pipeline` and `compositor_render` modules while keeping `smelter_decklink_audio` logs at info level.
+- **`src/main.rs`**: Entry point that initializes tracing/logging and creates a `Compositor` instance.
 
 - **`src/compositor.rs`**: Contains the `Compositor` struct which manages:
   - `GraphicsContext`: Handles wgpu graphics context initialization (required by Smelter)
   - `Pipeline`: The core Smelter compositor pipeline wrapped in `Arc<Mutex<>>` for thread-safe access
-  - `OutputId`: Identifies compositor outputs (e.g., "raw_output")
+  - `InputId`: Identifies the MP4 input source
+  - `OutputId`: Identifies compositor outputs
 
-  The `Compositor::new()` method is responsible for:
+  The `Compositor::new(input_path)` method is responsible for:
   1. Initializing the graphics context
   2. Creating and starting the pipeline
-  3. Registering DeckLink devices
+  3. Registering the MP4 input source
 
-  The `record_main_output()` method handles video recording to file with a specified duration.
+  The `start_recording()` method handles video recording to file with a specified duration.
+
+- **`src/assets.rs`**: Handles downloading test assets (MP4 input file) if not present locally.
 
 ### External Dependencies
 
-- **Smelter libraries** (`smelter-core`, `smelter-render`, `decklink`): Pinned to revision `005137d` from the Software Mansion Smelter repository
-  - `smelter-core`: Provides the core compositor functionality with DeckLink feature enabled
+- **Smelter libraries** (`smelter-core`, `smelter-render`): Pinned to tag `v0.5.0` from the Software Mansion Smelter repository
+  - `smelter-core`: Provides the core compositor functionality with vk-video feature enabled
   - `smelter-render`: Provides rendering capabilities with web-renderer feature enabled
-  - `decklink`: Optional DeckLink hardware integration
 
 - **wgpu 25.0.2**: Graphics library required by the compositor for GPU operations
 
-### Current State
-
-The compositor implementation contains `todo!()` placeholders in `compositor.rs` for:
-- Graphics context initialization (line 22)
-- Pipeline creation and startup (line 25)
-- DeckLink device registration (line 28)
-- Recording functionality (line 38)
+- **reqwest**: HTTP client for downloading test assets
 
 ## Resolution Constants
 
-The project defines `RESOLUTION_FHD` constant as `(1920, 1080)` in `compositor.rs:11` for Full HD video resolution.
+The project defines `RESOLUTION` constant as `(3840, 2160)` in `compositor.rs` for 4K video resolution.
